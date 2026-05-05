@@ -1,12 +1,14 @@
 [project]
 name = "spark-voice-chat"
 version = "0.1.0"
-description = "Local Qwen + CosyVoice workspace utilities"
+description = "Qwen TTS-LLM-STT voice chat server and client on DGX spark"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28.1",
     "langchain-core>=1.3.2",
     "langchain-deepseek>=1.0.1",
+    "pydantic>=2.11.0",
+    "websockets>=15.0.1",
 ]
 
 [tool.uv]
