@@ -2,7 +2,7 @@ services:
   vllm:
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: Dockerfile
       target: llm-runtime
       args:
         NGC_VLLM_IMAGE: ${QWEN_LLM_NGC_VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.04-py3}
@@ -37,11 +37,10 @@ services:
   qwen3-tts:
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: Dockerfile
       target: tts-runtime
       args:
         NGC_VLLM_IMAGE: ${QWEN_TTS_NGC_VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.04-py3}
-        VLLM_VERSION: ${QWEN_TTS_VLLM_VERSION:-0.20.0}
         VLLM_OMNI_REF: ${QWEN_TTS_VLLM_OMNI_REF:-main}
     ports:
       - "${QWEN_TTS_API_PORT:-8091}:8091"
@@ -63,7 +62,7 @@ services:
   voice-server:
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: Dockerfile
       target: stt-runtime
     depends_on:
       - qwen3-tts

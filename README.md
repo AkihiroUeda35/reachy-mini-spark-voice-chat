@@ -6,16 +6,16 @@ Local voice stack for DGX Spark built around three services managed from the rep
 - Qwen3-TTS backend at `http://localhost:8091`
 - OpenAI-compatible STT/TTS wrapper at `http://localhost:8020/v1`
 
-The stack is started from the top-level [docker-compose.yml](/home/aki/server/docker-compose.yml) and built from the shared [docker/Dockerfile](/home/aki/server/docker/Dockerfile).
+The stack is started from the top-level [docker-compose.yml](server/docker-compose.yml) and built from the shared [Dockerfile](server/Dockerfile).
 
 ## Layout
 
-- [docker](/home/aki/server/docker): shared multi-stage Dockerfile for `llm-runtime`, `tts-runtime`, and `stt-runtime`
-- [llm](/home/aki/server/llm): LLM runtime entrypoint and configuration wrapper
-- [tts](/home/aki/server/tts): Qwen3-TTS runtime entrypoint, models, and voices
-- [stt](/home/aki/server/stt): FastAPI wrapper, STT app code, and STT model cache
-- [tools](/home/aki/server/tools): local smoke-test and sample scripts
-- [spark-vllm-docker](/home/aki/server/spark-vllm-docker): upstream helper repo kept for wheels and Spark-specific vLLM assets
+- [Dockerfile](server/Dockerfile): shared multi-stage build for `llm-runtime`, `tts-runtime`, and `stt-runtime`
+- [llm](server/llm): LLM runtime entrypoint and configuration wrapper
+- [tts](server/tts): Qwen3-TTS runtime entrypoint, models, and voices
+- [stt](server/stt): FastAPI wrapper, STT app code, and STT model cache
+- [tools](server/tools): local smoke-test and sample scripts
+- [spark-vllm-docker](server/spark-vllm-docker): upstream helper repo kept for wheels and Spark-specific vLLM assets
 
 ## Services
 
@@ -101,7 +101,7 @@ curl http://localhost:8020/health
 
 ## Local Sample
 
-The sample script in [tools/langchain_openai_tts.py](/home/aki/server/tools/langchain_openai_tts.py) generates a short Japanese script with the local LLM, sends it to the local TTS wrapper, and writes a WAV file.
+The sample script in [tools/langchain_openai_tts.py](server/tools/langchain_openai_tts.py) generates a short Japanese script with the local LLM, sends it to the local TTS wrapper, and writes a WAV file.
 
 Install local dependencies and run it from the repository root.
 
@@ -112,14 +112,14 @@ uv run python tools/langchain_openai_tts.py
 
 Default output:
 
-- [data/spark_voice_chat.wav](/home/aki/server/data/spark_voice_chat.wav)
+- [data/spark_voice_chat.wav](server/data/spark_voice_chat.wav)
 
 ## Main Runtime Data
 
 - LLM/HF cache: `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, `~/.triton`
-- TTS model cache: [tts/models](/home/aki/server/tts/models)
-- STT model cache: [stt/models](/home/aki/server/stt/models)
-- Voice definitions: [tts/voices/voices.json](/home/aki/server/tts/voices/voices.json)
+- TTS model cache: [tts/models](server/tts/models)
+- STT model cache: [stt/models](server/stt/models)
+- Voice definitions: [tts/voices/voices.json](server/tts/voices/voices.json)
 
 ## Important Environment Variables
 
@@ -149,6 +149,6 @@ Wrapper:
 
 ## Notes
 
-- The shared Dockerfile keeps the build flow unified, but `llm-runtime` and `tts-runtime` remain separate targets because their runtime dependencies differ.
-- The LLM runtime still consumes wheels from [spark-vllm-docker/wheels](/home/aki/server/spark-vllm-docker/wheels) to match the Spark-tested vLLM stack.
+- The shared top-level Dockerfile keeps the build flow unified, but `llm-runtime` and `tts-runtime` remain separate targets because their runtime dependencies differ.
+- The LLM runtime still consumes wheels from [spark-vllm-docker/wheels](server/spark-vllm-docker/wheels) to match the Spark-tested vLLM stack.
 - First startup can take a long time because both the LLM and TTS models may need to download and initialize.
