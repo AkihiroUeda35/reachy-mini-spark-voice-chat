@@ -1,0 +1,17 @@
+.git
+.triton_cache
+.venv
+data
+llm-backend
+tts-stt-server
+__pycache__
+*.pyc
+stt/models
+tts/models
+tts/voices/*.wav
+tts/voices/*.mp3
+tts/voices/*.m4a
+tts/voices/*.flac
+spark-vllm-docker/*
+!spark-vllm-docker/wheels/
+!spark-vllm-docker/wheels/*.whl

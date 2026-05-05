@@ -1,25 +1,11 @@
 services:
   vllm:
-    entrypoint:
-      - /opt/nvidia/nvidia_entrypoint.sh
-      - /bin/bash
-      - -lc
-    command:
-      - |
-        exec vllm serve sakamakismile/Huihui-Qwen3.6-27B-abliterated-NVFP4-MTP \
-          --trust-remote-code \
-          --served-model-name spark \
-          --quantization modelopt \
-          --max-model-len 262144 \
-          --max-num-seqs 4 \
-          --port 8010 \
-          --kv-cache-dtype fp8 \
-          --gpu-memory-utilization 0.6 \
-          --reasoning-parser qwen3 \
-          --enable-auto-tool-choice \
-          --tool-call-parser qwen3_coder \
-          --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":4,"moe_backend":"triton"}'
-    image: vllm-node
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: llm-runtime
+      args:
+        NGC_VLLM_IMAGE: ${QWEN_LLM_NGC_VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.04-py3}
     container_name: vllm_node
     restart: unless-stopped
     network_mode: host
@@ -27,7 +13,22 @@ services:
     ipc: host
     gpus: all
     environment:
-      - NCCL_IGNORE_CPU_AFFINITY=1
+      NCCL_IGNORE_CPU_AFFINITY: "1"
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+      QWEN_LLM_MODEL: ${QWEN_LLM_MODEL:-sakamakismile/Huihui-Qwen3.6-27B-abliterated-NVFP4-MTP}
+      QWEN_LLM_HOST: 0.0.0.0
+      QWEN_LLM_PORT: "8010"
+      QWEN_LLM_SERVED_MODEL_NAME: ${QWEN_LLM_SERVED_MODEL_NAME:-spark}
+      QWEN_LLM_QUANTIZATION: ${QWEN_LLM_QUANTIZATION:-modelopt}
+      QWEN_LLM_MAX_MODEL_LEN: ${QWEN_LLM_MAX_MODEL_LEN:-262144}
+      QWEN_LLM_MAX_NUM_SEQS: ${QWEN_LLM_MAX_NUM_SEQS:-4}
+      QWEN_LLM_KV_CACHE_DTYPE: ${QWEN_LLM_KV_CACHE_DTYPE:-fp8}
+      QWEN_LLM_GPU_MEMORY_UTILIZATION: ${QWEN_LLM_GPU_MEMORY_UTILIZATION:-0.6}
+      QWEN_LLM_REASONING_PARSER: ${QWEN_LLM_REASONING_PARSER:-qwen3}
+      QWEN_LLM_ENABLE_AUTO_TOOL_CHOICE: ${QWEN_LLM_ENABLE_AUTO_TOOL_CHOICE:-1}
+      QWEN_LLM_TOOL_CALL_PARSER: ${QWEN_LLM_TOOL_CALL_PARSER:-qwen3_coder}
+      QWEN_LLM_SPECULATIVE_CONFIG: '{"method":"qwen3_5_mtp","num_speculative_tokens":4,"moe_backend":"triton"}'
     volumes:
       - ~/.cache/vllm:/root/.cache/vllm
       - ~/.cache/flashinfer:/root/.cache/flashinfer
@@ -35,8 +36,9 @@ services:
       - ~/.cache/huggingface:/root/.cache/huggingface
   qwen3-tts:
     build:
-      context: ./tts-stt-server
-      dockerfile: qwen3-tts-backend/Dockerfile
+      context: .
+      dockerfile: docker/Dockerfile
+      target: tts-runtime
       args:
         NGC_VLLM_IMAGE: ${QWEN_TTS_NGC_VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.04-py3}
         VLLM_VERSION: ${QWEN_TTS_VLLM_VERSION:-0.20.0}
@@ -53,15 +55,16 @@ services:
       QWEN_TTS_ENFORCE_EAGER: ${QWEN_TTS_ENFORCE_EAGER:-1}
       QWEN_TTS_NO_ASYNC_CHUNK: ${QWEN_TTS_NO_ASYNC_CHUNK:-0}
     volumes:
-      - ./tts-stt-server/models:/models
+      - ./tts/models:/models
     gpus: all
     ipc: host
     restart: unless-stopped
 
   voice-server:
     build:
-      context: ./tts-stt-server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: docker/Dockerfile
+      target: stt-runtime
     depends_on:
       - qwen3-tts
     ports:
@@ -78,6 +81,6 @@ services:
       TTS_DEFAULT_VOICE: ${TTS_DEFAULT_VOICE:-Ono_Anna}
       QWEN_TTS_VOICES_FILE: /voices/voices.json
     volumes:
-      - ./tts-stt-server/models:/models
-      - ./tts-stt-server/voices:/voices
+      - ./stt/models:/models
+      - ./tts/voices:/voices
     restart: unless-stopped

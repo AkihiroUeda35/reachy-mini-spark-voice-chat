@@ -6,5 +6,6 @@ tools/.venv/
 data/*
 __pycache__/
 *.pyc
-tts-stt-server/models/*
-tts-stt-server/voices/*
+
+*/models/*
+*/voices/*
