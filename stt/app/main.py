@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import json
@@ -28,9 +29,20 @@ _stt_lock = threading.Lock()
 logger = logging.getLogger("tts")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+_tts_warmup_started = False
+
 
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default).strip() or default
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    global _tts_warmup_started
+    if _tts_warmup_started:
+        return
+    _tts_warmup_started = True
+    await _warmup_tts_upstream()
 
 
 def get_stt_model() -> WhisperModel:
@@ -84,6 +96,14 @@ def _tts_upstream_headers() -> dict[str, str]:
     if not api_key:
         return {}
     return {"Authorization": f"Bearer {api_key}"}
+
+
+def _tts_warmup_enabled() -> bool:
+    return _env("TTS_WARMUP_ENABLED", "1") != "0"
+
+
+def _tts_warmup_text() -> str:
+    return _env("TTS_WARMUP_TEXT", "こんにちは。")
 
 
 def _default_task_type() -> Literal["CustomVoice", "VoiceDesign", "Base"]:
@@ -431,6 +451,42 @@ async def _tts_health() -> bool:
             return response.status_code == 200
     except httpx.HTTPError:
         return False
+
+
+async def _warmup_tts_upstream() -> None:
+    if not _tts_warmup_enabled():
+        logger.info("TTS upstream warmup disabled")
+        return
+
+    for _attempt in range(60):
+        if await _tts_health():
+            break
+        await asyncio.sleep(2)
+    else:
+        logger.warning("TTS upstream warmup skipped because upstream health never became ready")
+        return
+
+    payload = {
+        "model": _tts_upstream_model_name(),
+        "input": _tts_warmup_text(),
+        "voice": _env("TTS_DEFAULT_VOICE", _env("QWEN_TTS_DEFAULT_VOICE", "Ono_Anna")),
+        "task_type": _default_task_type(),
+        "language": _env("TTS_DEFAULT_LANGUAGE", _env("QWEN_TTS_DEFAULT_LANGUAGE", "Japanese")),
+        "response_format": "wav",
+        "stream": False,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=_tts_upstream_timeout()) as client:
+            response = await client.post(
+                f"{_tts_upstream_base_url()}/v1/audio/speech",
+                json=payload,
+                headers=_tts_upstream_headers(),
+            )
+            response.raise_for_status()
+        logger.info("TTS upstream warmup completed")
+    except httpx.HTTPError as exc:
+        logger.warning("TTS upstream warmup failed: %s", exc)
 
 
 async def _tts_request_with_failover(method: str, path: str, **kwargs: Any) -> httpx.Response:
