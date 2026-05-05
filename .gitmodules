@@ -1,0 +1,3 @@
+[submodule "spark-vllm-docker"]
+	path = spark-vllm-docker
+	url = https://github.com/eugr/spark-vllm-docker.git
