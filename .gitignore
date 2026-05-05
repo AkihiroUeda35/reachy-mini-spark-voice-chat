@@ -1,0 +1,10 @@
+.venv/
+.triton_cache/
+.DS_Store
+._*
+tools/.venv/
+data/*
+__pycache__/
+*.pyc
+tts-stt-server/models/*
+tts-stt-server/voices/*

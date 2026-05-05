@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+models/
+voices/*.wav
+voices/*.mp3
+voices/*.m4a
+voices/*.flac
+
