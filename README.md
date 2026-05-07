@@ -41,7 +41,8 @@ Runs Qwen3-TTS through `vllm-omni` from the `tts-runtime` target.
 Runs the OpenAI-compatible wrapper from the `stt-runtime` target.
 
 - Port: `8020`
-- STT backend: Faster Whisper `large-v3-turbo` on CPU by default
+- STT backend: Faster Whisper `large-v3-turbo` on GPU
+- STT warmup: enabled on startup by default
 - TTS upstream: `http://qwen3-tts:8091`
 
 ## Requirements
@@ -149,6 +150,7 @@ Wrapper:
 - `STT_BEAM_SIZE`
 - `STT_BEST_OF`
 - `STT_CONDITION_ON_PREVIOUS_TEXT`
+- `STT_WARMUP_ENABLED`
 - `TTS_DEFAULT_TASK_TYPE`
 - `TTS_DEFAULT_LANGUAGE`
 - `TTS_DEFAULT_VOICE`

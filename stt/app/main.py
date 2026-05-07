@@ -25,12 +25,14 @@ app = FastAPI(title="OpenAI-compatible Qwen3-TTS + Faster Whisper Server")
 
 _stt_model: WhisperModel | None = None
 _stt_lock = threading.Lock()
+_stt_warmup_task: asyncio.Task[None] | None = None
 _tts_warmup_task: asyncio.Task[None] | None = None
 
 logger = logging.getLogger("tts")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 _tts_warmup_started = False
+_stt_warmup_started = False
 
 
 def _env(name: str, default: str) -> str:
@@ -74,27 +76,40 @@ def _stt_condition_on_previous_text() -> bool:
     return _env_bool("STT_CONDITION_ON_PREVIOUS_TEXT", False)
 
 
+def _stt_warmup_enabled() -> bool:
+    return _env("STT_WARMUP_ENABLED", "1") != "0"
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
-    global _tts_warmup_started, _tts_warmup_task
-    if _tts_warmup_started:
-        return
-    _tts_warmup_started = True
-    _tts_warmup_task = asyncio.create_task(_warmup_tts_upstream())
+    global _stt_warmup_started, _stt_warmup_task, _tts_warmup_started, _tts_warmup_task
+    if not _stt_warmup_started:
+        _stt_warmup_started = True
+        _stt_warmup_task = asyncio.create_task(_warmup_stt_model())
+    if not _tts_warmup_started:
+        _tts_warmup_started = True
+        _tts_warmup_task = asyncio.create_task(_warmup_tts_upstream())
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global _tts_warmup_task
-    if _tts_warmup_task is None or _tts_warmup_task.done():
-        return
-    _tts_warmup_task.cancel()
-    try:
-        await _tts_warmup_task
-    except asyncio.CancelledError:
-        logger.info("Cancelled pending TTS warmup task during shutdown")
-    finally:
-        _tts_warmup_task = None
+    global _stt_warmup_task, _tts_warmup_task
+    if _stt_warmup_task is not None and not _stt_warmup_task.done():
+        _stt_warmup_task.cancel()
+        try:
+            await _stt_warmup_task
+        except asyncio.CancelledError:
+            logger.info("Cancelled pending STT warmup task during shutdown")
+        finally:
+            _stt_warmup_task = None
+    if _tts_warmup_task is not None and not _tts_warmup_task.done():
+        _tts_warmup_task.cancel()
+        try:
+            await _tts_warmup_task
+        except asyncio.CancelledError:
+            logger.info("Cancelled pending TTS warmup task during shutdown")
+        finally:
+            _tts_warmup_task = None
 
 
 def get_stt_model() -> WhisperModel:
@@ -103,8 +118,8 @@ def get_stt_model() -> WhisperModel:
         with _stt_lock:
             if _stt_model is None:
                 stt_model_size = _env("STT_MODEL_SIZE", "large-v3-turbo")
-                stt_device = _env("STT_DEVICE", "cpu")
-                stt_compute_type = _env("STT_COMPUTE_TYPE", "int8")
+                stt_device = _env("STT_DEVICE", "cuda")
+                stt_compute_type = _env("STT_COMPUTE_TYPE", "float16")
                 stt_cpu_threads = _env_int("STT_CPU_THREADS", 8)
                 stt_num_workers = _env_int("STT_NUM_WORKERS", 1)
                 stt_default_language = _stt_default_language() or "auto"
@@ -595,6 +610,20 @@ async def _tts_health() -> bool:
             return response.status_code == 200
     except httpx.HTTPError:
         return False
+
+
+async def _warmup_stt_model() -> None:
+    if not _stt_warmup_enabled():
+        logger.info("STT warmup disabled")
+        return
+
+    logger.info("Starting STT warmup in background")
+
+    try:
+        await asyncio.to_thread(get_stt_model)
+        logger.info("STT warmup completed")
+    except Exception as exc:
+        logger.warning("STT warmup failed: %s", exc)
 
 
 async def _warmup_tts_upstream() -> None:

@@ -64,14 +64,17 @@ services:
       context: .
       dockerfile: Dockerfile
       target: stt-runtime
+      args:
+        NGC_VLLM_IMAGE: ${STT_NGC_VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.04-py3}
     depends_on:
       - qwen3-tts
     ports:
       - "8020:8020"
+    gpus: all
     environment:
       STT_MODEL_SIZE: large-v3-turbo
-      STT_DEVICE: cpu
-      STT_COMPUTE_TYPE: int8
+      STT_DEVICE: cuda
+      STT_COMPUTE_TYPE: float16
       STT_CPU_THREADS: ${STT_CPU_THREADS:-14}
       STT_NUM_WORKERS: ${STT_NUM_WORKERS:-1}
       STT_DEFAULT_LANGUAGE: ${STT_DEFAULT_LANGUAGE:-ja}

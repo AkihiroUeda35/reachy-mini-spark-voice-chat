@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-output",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Save the transcription result to a file. Defaults to on.",
     )
     return parser.parse_args()

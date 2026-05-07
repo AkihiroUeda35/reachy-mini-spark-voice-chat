@@ -63,7 +63,11 @@ ENV HF_HOME=/models/huggingface \
 
 ENTRYPOINT ["qwen3-tts-run"]
 
-FROM python:3.12-slim AS stt-runtime
+FROM vllm-base AS stt-runtime
+
+ARG CTRANSLATE2_VERSION=4.7.1
+ARG CTRANSLATE2_CUDA_ARCHITECTURES=86
+ARG CTRANSLATE2_CUDA_ARCH_LIST=8.6+PTX
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -76,17 +80,39 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
+        cmake \
         curl \
         ffmpeg \
         git \
+        libopenblas-dev \
         libsndfile1 \
+        ninja-build \
         sox \
     && rm -rf /var/lib/apt/lists/*
 
 COPY stt/requirements.txt .
 
 RUN python -m pip install --upgrade pip setuptools wheel \
-    && pip install -r requirements.txt
+    && pip install -r requirements.txt \
+    && pip uninstall -y ctranslate2 \
+    && git clone --recursive --branch v${CTRANSLATE2_VERSION} https://github.com/OpenNMT/CTranslate2.git /tmp/CTranslate2 \
+    && cmake -S /tmp/CTranslate2 -B /tmp/CTranslate2/build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_CLI=OFF \
+        -DCMAKE_CUDA_ARCHITECTURES=${CTRANSLATE2_CUDA_ARCHITECTURES} \
+        -DCUDA_ARCH_LIST=${CTRANSLATE2_CUDA_ARCH_LIST} \
+        -DWITH_CUDA=ON \
+        -DWITH_CUDNN=OFF \
+        -DWITH_MKL=OFF \
+        -DWITH_OPENBLAS=ON \
+        -DOPENMP_RUNTIME=COMP \
+    && cmake --build /tmp/CTranslate2/build --parallel \
+    && cmake --install /tmp/CTranslate2/build \
+    && python -m pip install -r /tmp/CTranslate2/python/install_requirements.txt \
+    && cd /tmp/CTranslate2/python \
+    && CTRANSLATE2_ROOT=/usr/local python setup.py bdist_wheel \
+    && pip install dist/*.whl \
+    && rm -rf /tmp/CTranslate2
 
 COPY stt/app ./app
 

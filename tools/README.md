@@ -48,6 +48,25 @@ uv run python tools/whisper_asr_test.py data/your_audio.wav --transport http --r
 uv run python tools/whisper_asr_test.py --output data/custom_transcript.txt
 ```
 
+## Pipecat Voice Chain
+
+Use the local STT wrapper, the local OpenAI-compatible chat endpoint, and the local TTS wrapper in one script. The script accepts microphone input by default, can take an audio file instead, and can either play the generated reply through the default sound device or write it to a WAV file.
+In `sound` mode, the assistant starts speaking sentence by sentence while the LLM is still generating later tokens.
+
+```bash
+cd ..
+uv sync
+uv run python tools/pipecat_asr_llm_tts.py
+```
+
+Use a file as input and save the assistant audio to disk.
+
+```bash
+uv run python tools/pipecat_asr_llm_tts.py data/your_audio.wav --output-mode file --output-audio data/reply.wav
+```
+
+The script reuses the same STT parameters as `whisper_asr_test.py`, so options such as `--transport`, `--language`, `--vad-threshold`, and `--response-format` behave the same way.
+
 ## Notes
 
 - Default chat model: `spark`
