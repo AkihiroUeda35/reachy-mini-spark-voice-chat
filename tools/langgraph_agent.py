@@ -1,16 +1,35 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from typing import Any, cast
 
 from langchain_deepseek import ChatDeepSeek
-from langchain_core.messages import AIMessageChunk
-from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import AIMessageChunk, SystemMessage
+from langchain_core.tools import tool
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import SecretStr
 from pipecat.frames.frames import ErrorFrame, LLMContextFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from jma_weather_tool import LANGGRAPH_TOOLS
+try:
+    from jma_weather_tool import get_jma_weather_tool
+except ModuleNotFoundError:
+    from tools.jma_weather_tool import get_jma_weather_tool
+
+
+@tool
+def get_current_time_tool() -> str:
+    """Get the current local date and time on this machine."""
+    now = datetime.now().astimezone()
+    return now.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+LANGGRAPH_TOOLS = [
+    get_jma_weather_tool,
+    get_current_time_tool,
+]
 
 
 def _extract_chunk_text(chunk) -> str:
@@ -40,13 +59,29 @@ def build_langgraph_agent(args: argparse.Namespace):
         max_tokens=args.max_completion_tokens,
         use_responses_api=False,
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-    ).bind_tools(LANGGRAPH_TOOLS, parallel_tool_calls=False)
+    ).bind_tools(LANGGRAPH_TOOLS, parallel_tool_calls=True)
 
-    return create_react_agent(
-        model,
-        LANGGRAPH_TOOLS,
-        prompt=args.system_prompt,
+    async def call_model(state: MessagesState) -> dict[str, list[Any]]:
+        response = await model.ainvoke([
+            SystemMessage(content=args.system_prompt),
+            *state["messages"],
+        ])
+        return {"messages": [response]}
+
+    graph = StateGraph(MessagesState)
+    graph.add_node("assistant", call_model)
+    graph.add_node("tools", ToolNode(LANGGRAPH_TOOLS))
+    graph.add_edge(START, "assistant")
+    graph.add_conditional_edges(
+        "assistant",
+        tools_condition,
+        {
+            "tools": "tools",
+            "__end__": END,
+        },
     )
+    graph.add_edge("tools", "assistant")
+    return graph.compile()
 
 
 class LangGraphLLMProcessor(FrameProcessor):
@@ -64,7 +99,7 @@ class LangGraphLLMProcessor(FrameProcessor):
         try:
             await self.push_frame(LLMFullResponseStartFrame(), direction)
             async for chunk, _metadata in self._agent.astream(
-                {"messages": frame.context.messages},
+                cast(MessagesState, {"messages": frame.context.messages}),
                 stream_mode="messages",
             ):
                 if not isinstance(chunk, AIMessageChunk):

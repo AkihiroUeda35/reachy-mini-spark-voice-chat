@@ -34,8 +34,8 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 TTS_TIMEOUT = float(os.environ.get("TTS_TIMEOUT", "600"))
 TTS_STREAM_CHUNK_BYTES = int(os.environ.get("TTS_STREAM_CHUNK_BYTES", "8192"))
-TTS_PLAYBACK_LEAD_IN_MS = int(os.environ.get("TTS_PLAYBACK_LEAD_IN_MS", "10"))
-TTS_PLAYBACK_FADE_IN_MS = int(os.environ.get("TTS_PLAYBACK_FADE_IN_MS", "30"))
+TTS_PLAYBACK_LEAD_IN_MS = int(os.environ.get("TTS_PLAYBACK_LEAD_IN_MS", "5"))
+TTS_PLAYBACK_FADE_IN_MS = int(os.environ.get("TTS_PLAYBACK_FADE_IN_MS", "5"))
 
 
 @dataclass
