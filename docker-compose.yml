@@ -47,7 +47,7 @@ services:
     environment:
       HF_HOME: /models/huggingface
       TRANSFORMERS_CACHE: /models/huggingface
-      QWEN_TTS_MODEL: ${QWEN_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice}
+      QWEN_TTS_MODEL: ${QWEN_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}
       QWEN_TTS_HOST: 0.0.0.0
       QWEN_TTS_PORT: 8091
       QWEN_TTS_GPU_MEMORY_UTILIZATION: ${QWEN_TTS_GPU_MEMORY_UTILIZATION:-0.1}
@@ -72,7 +72,8 @@ services:
       - "8020:8020"
     gpus: all
     environment:
-      STT_MODEL_SIZE: large-v3-turbo
+      STT_MODEL_SIZE: ${STT_MODEL_SIZE:-RoachLin/kotoba-whisper-v2.2-faster}
+      STT_MODEL_ID: ${STT_MODEL_ID:-RoachLin/kotoba-whisper-v2.2-faster}
       STT_DEVICE: cuda
       STT_COMPUTE_TYPE: float16
       STT_CPU_THREADS: ${STT_CPU_THREADS:-14}
@@ -83,7 +84,8 @@ services:
       STT_CONDITION_ON_PREVIOUS_TEXT: ${STT_CONDITION_ON_PREVIOUS_TEXT:-0}
       OMP_NUM_THREADS: ${STT_CPU_THREADS:-14}
       TTS_UPSTREAM_BASE_URL: ${TTS_UPSTREAM_BASE_URL:-http://qwen3-tts:8091}
-      TTS_UPSTREAM_MODEL: ${QWEN_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice}
+      TTS_UPSTREAM_MODEL: ${QWEN_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}
+      TTS_PUBLIC_MODEL_NAME: ${TTS_PUBLIC_MODEL_NAME:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}
       TTS_UPSTREAM_TIMEOUT: ${QWEN_TTS_TIMEOUT:-600}
       TTS_DEFAULT_TASK_TYPE: ${TTS_DEFAULT_TASK_TYPE:-CustomVoice}
       TTS_DEFAULT_LANGUAGE: ${TTS_DEFAULT_LANGUAGE:-Japanese}

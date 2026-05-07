@@ -19,23 +19,26 @@ import numpy as np
 import soundfile as sf
 from websockets import connect as ws_connect
 
+from openai_model_registry import resolve_model
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR.parent / os.environ.get("ASR_OUTPUT_DIR", "data")
 ASR_BASE_URL = os.environ.get("ASR_BASE_URL", "http://localhost:8020/v1").rstrip("/")
 ASR_API_KEY = os.environ.get("ASR_API_KEY", "local")
-ASR_MODEL = os.environ.get("ASR_MODEL", "whisper-1")
+ASR_MODEL = os.environ.get("ASR_MODEL")
+ASR_MODEL_FALLBACK = os.environ.get("ASR_MODEL_FALLBACK", "whisper-1")
 ASR_LANGUAGE = os.environ.get("ASR_LANGUAGE", "ja")
 ASR_TIMEOUT = float(os.environ.get("ASR_TIMEOUT", "600"))
 ASR_TRANSPORT = os.environ.get("ASR_TRANSPORT", "realtime")
 ASR_SAMPLE_RATE = int(os.environ.get("ASR_SAMPLE_RATE", "16000"))
 ASR_RECORD_SECONDS = float(os.environ.get("ASR_RECORD_SECONDS", "5"))
 ASR_REALTIME_CHUNK_MS = int(os.environ.get("ASR_REALTIME_CHUNK_MS", "250"))
-ASR_VAD_THRESHOLD = float(os.environ.get("ASR_VAD_THRESHOLD", "0.015"))
+ASR_VAD_THRESHOLD = float(os.environ.get("ASR_VAD_THRESHOLD", "0.012"))
 ASR_VAD_FRAME_MS = int(os.environ.get("ASR_VAD_FRAME_MS", "30"))
-ASR_VAD_START_MS = int(os.environ.get("ASR_VAD_START_MS", "150"))
+ASR_VAD_START_MS = int(os.environ.get("ASR_VAD_START_MS", "90"))
 ASR_VAD_END_MS = int(os.environ.get("ASR_VAD_END_MS", "900"))
-ASR_VAD_PREROLL_MS = int(os.environ.get("ASR_VAD_PREROLL_MS", "300"))
+ASR_VAD_PREROLL_MS = int(os.environ.get("ASR_VAD_PREROLL_MS", "450"))
 ASR_VAD_MAX_SECONDS = float(os.environ.get("ASR_VAD_MAX_SECONDS", "20"))
 
 
@@ -221,6 +224,16 @@ def prepare_audio(args: argparse.Namespace) -> PreparedAudio:
     if args.microphone or not args.file:
         return _prepared_audio_from_microphone(args.sample_rate, args.record_seconds)
     return _prepared_audio_from_file(Path(args.file).expanduser().resolve(), args.sample_rate)
+
+
+def resolve_asr_model(args: argparse.Namespace) -> str:
+    return resolve_model(
+        base_url=args.base_url,
+        api_key=args.api_key,
+        explicit_model=args.model,
+        capability="transcription",
+        fallback_model=ASR_MODEL_FALLBACK,
+    )
 
 
 def _http_form_data(args: argparse.Namespace) -> dict[str, str]:
@@ -562,6 +575,7 @@ def print_payload(payload: str | dict) -> None:
 def main() -> int:
     args = parse_args()
     try:
+        args.model = resolve_asr_model(args)
         if args.transport == "realtime" and (args.microphone or not args.file):
             payload, audio = asyncio.run(transcribe_realtime_microphone(args))
         else:

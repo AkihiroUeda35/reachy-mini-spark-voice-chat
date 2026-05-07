@@ -80,6 +80,14 @@ def _stt_warmup_enabled() -> bool:
     return _env("STT_WARMUP_ENABLED", "1") != "0"
 
 
+def _stt_model_name() -> str:
+    return _env("STT_MODEL_SIZE", "RoachLin/kotoba-whisper-v2.2-faster")
+
+
+def _stt_public_model_name() -> str:
+    return _env("STT_MODEL_ID", _stt_model_name())
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
     global _stt_warmup_started, _stt_warmup_task, _tts_warmup_started, _tts_warmup_task
@@ -117,7 +125,7 @@ def get_stt_model() -> WhisperModel:
     if _stt_model is None:
         with _stt_lock:
             if _stt_model is None:
-                stt_model_size = _env("STT_MODEL_SIZE", "large-v3-turbo")
+                stt_model_size = _stt_model_name()
                 stt_device = _env("STT_DEVICE", "cuda")
                 stt_compute_type = _env("STT_COMPUTE_TYPE", "float16")
                 stt_cpu_threads = _env_int("STT_CPU_THREADS", 8)
@@ -170,7 +178,30 @@ def _tts_upstream_base_url() -> str:
 
 
 def _tts_upstream_model_name() -> str:
-    return _env("TTS_UPSTREAM_MODEL", _env("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"))
+    return _env("TTS_UPSTREAM_MODEL", _env("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"))
+
+
+def _tts_public_model_name() -> str:
+    return _env("TTS_PUBLIC_MODEL_NAME", _tts_upstream_model_name())
+
+
+def _dedupe_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for model in models:
+        model_id = model.get("id")
+        if not isinstance(model_id, str) or model_id in seen:
+            continue
+        seen.add(model_id)
+        deduped.append(model)
+    return deduped
+
+
+def _resolve_tts_request_model(model_name: str | None) -> str:
+    normalized = (model_name or "").strip()
+    if not normalized or normalized in {"tts-1", _tts_public_model_name()}:
+        return _tts_upstream_model_name()
+    return normalized
 
 
 def _tts_upstream_timeout() -> float:
@@ -517,7 +548,7 @@ def _extract_text_from_response(message: dict[str, Any], fallback: str) -> str:
 
 
 class SpeechRequest(BaseModel):
-    model: str = "tts-1"
+    model: str = Field(default_factory=_tts_public_model_name)
     input: str = Field(..., min_length=1)
     voice: str | dict[str, str] = Field(default_factory=lambda: _env("TTS_DEFAULT_VOICE", _env("QWEN_TTS_DEFAULT_VOICE", "Ono_Anna")))
     instructions: str = ""
@@ -535,13 +566,13 @@ class SpeechRequest(BaseModel):
 
 
 class RealtimeSession(BaseModel):
-    model: str = "tts-1"
+    model: str = Field(default_factory=_tts_public_model_name)
     voice: str = Field(default_factory=lambda: _env("TTS_DEFAULT_VOICE", _env("QWEN_TTS_DEFAULT_VOICE", "Ono_Anna")))
     instructions: str = ""
     input_text: str = ""
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] = Field(default_factory=_default_task_type)
     language: str = Field(default_factory=lambda: _env("TTS_DEFAULT_LANGUAGE", _env("QWEN_TTS_DEFAULT_LANGUAGE", "Japanese")))
-    transcription_model: str = "whisper-1"
+    transcription_model: str = Field(default_factory=_stt_public_model_name)
     input_audio_transcription: bool = False
     input_audio_format: Literal["pcm16", "wav"] = "pcm16"
     input_audio_sample_rate: int = Field(default=16000, ge=1)
@@ -563,9 +594,7 @@ def _tts_request_payload(
         "response_format": response_format or req.response_format.lower(),
     }
 
-    model_name = req.model.strip()
-    if model_name and model_name != "tts-1":
-        payload["model"] = model_name
+    payload["model"] = _resolve_tts_request_model(req.model)
 
     if use_stream:
         payload["stream"] = True
@@ -710,8 +739,11 @@ async def health():
     return {
         "status": "ok",
         "stt_model_loaded": _stt_model is not None,
+        "stt_model": _stt_model_name(),
+        "stt_public_model": _stt_public_model_name(),
         "tts_upstream_backend": _tts_upstream_base_url(),
         "tts_upstream_model": _tts_upstream_model_name(),
+        "tts_public_model": _tts_public_model_name(),
         "tts_upstream_healthy": await _tts_health(),
     }
 
@@ -719,8 +751,30 @@ async def health():
 @app.get("/v1/models")
 async def models():
     data = [
-        {"id": "whisper-1", "object": "model", "owned_by": "local"},
-        {"id": "tts-1", "object": "model", "owned_by": "local"},
+        {
+            "id": _stt_public_model_name(),
+            "object": "model",
+            "owned_by": "local",
+            "metadata": {"capabilities": ["transcription"], "default": True, "backend_model": _stt_model_name()},
+        },
+        {
+            "id": "whisper-1",
+            "object": "model",
+            "owned_by": "local",
+            "metadata": {"capabilities": ["transcription"], "alias_for": _stt_public_model_name()},
+        },
+        {
+            "id": _tts_public_model_name(),
+            "object": "model",
+            "owned_by": "local",
+            "metadata": {"capabilities": ["speech"], "default": True, "backend_model": _tts_upstream_model_name()},
+        },
+        {
+            "id": "tts-1",
+            "object": "model",
+            "owned_by": "local",
+            "metadata": {"capabilities": ["speech"], "alias_for": _tts_public_model_name()},
+        },
     ]
 
     try:
@@ -732,15 +786,22 @@ async def models():
             if isinstance(upstream_models, list):
                 data.extend(upstream_models)
     except (httpx.HTTPError, ValueError):
-        data.append({"id": _tts_upstream_model_name(), "object": "model", "owned_by": "local"})
+        data.append(
+            {
+                "id": _tts_upstream_model_name(),
+                "object": "model",
+                "owned_by": "local",
+                "metadata": {"capabilities": ["speech"], "backend": "upstream"},
+            }
+        )
 
-    return {"object": "list", "data": data}
+    return {"object": "list", "data": _dedupe_models(data)}
 
 
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
     file: UploadFile = File(...),
-    model: str = Form(default="whisper-1"),
+    model: str | None = Form(default=None),
     language: str | None = Form(default=None),
     prompt: str | None = Form(default=None),
     response_format: Literal["json", "text", "verbose_json"] = Form(default="json"),
@@ -771,7 +832,7 @@ async def create_transcription(
 @app.post("/v1/audio/translations")
 async def create_translation(
     file: UploadFile = File(...),
-    model: str = Form(default="whisper-1"),
+    model: str | None = Form(default=None),
     prompt: str | None = Form(default=None),
     response_format: Literal["json", "text"] = Form(default="json"),
     temperature: float = Form(default=0),

@@ -12,13 +12,14 @@ from pathlib import Path
 import httpx
 import numpy as np
 import soundfile as sf
-from pipecat.frames.frames import EndFrame, ErrorFrame, LLMContextFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame, OutputAudioRawFrame
+from langgraph_agent import LangGraphLLMProcessor
+from openai_model_registry import resolve_model
+from pipecat.frames.frames import EndFrame, ErrorFrame, FunctionCallInProgressFrame, FunctionCallResultFrame, LLMContextFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame, OutputAudioRawFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.openai.llm import OpenAILLMService
 
 import langchain_openai_tts as tts_defaults
 import whisper_asr_test as asr_tools
@@ -27,10 +28,14 @@ import whisper_asr_test as asr_tools
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant Reachy(リーチー) in a spoken Japanese conversation. "
     "Your reply will be read aloud, so keep it concise, natural, and easy to speak. "
-    "Avoid markdown, bullets, emojis, and long enumerations."
+    "Avoid markdown, bullets, emojis, and long enumerations. "
+    "If you need a tool, call it immediately without filler like '確認します'. "
+    "Only produce user-facing answer text after you have the tool result."
 )
 TTS_TIMEOUT = float(os.environ.get("TTS_TIMEOUT", "600"))
 TTS_STREAM_CHUNK_BYTES = int(os.environ.get("TTS_STREAM_CHUNK_BYTES", "8192"))
+TTS_PLAYBACK_LEAD_IN_MS = int(os.environ.get("TTS_PLAYBACK_LEAD_IN_MS", "10"))
+TTS_PLAYBACK_FADE_IN_MS = int(os.environ.get("TTS_PLAYBACK_FADE_IN_MS", "30"))
 
 
 @dataclass
@@ -124,6 +129,7 @@ class LiveAudioPlayer(FrameProcessor):
         super().__init__(name="LiveAudioPlayer")
         self._device = device
         self._stream = None
+        self._playback_started = False
         self.errors: list[str] = []
 
     def _ensure_stream(self, sample_rate: int, num_channels: int):
@@ -150,7 +156,25 @@ class LiveAudioPlayer(FrameProcessor):
         if isinstance(frame, OutputAudioRawFrame):
             try:
                 stream = self._ensure_stream(frame.sample_rate, frame.num_channels)
-                await asyncio.to_thread(stream.write, frame.audio)
+                if not self._playback_started:
+                    lead_in_bytes = silence_pcm16(
+                        sample_rate=frame.sample_rate,
+                        num_channels=frame.num_channels,
+                        duration_ms=TTS_PLAYBACK_LEAD_IN_MS,
+                    )
+                    if lead_in_bytes:
+                        await asyncio.to_thread(stream.write, lead_in_bytes)
+                    audio_bytes = apply_fade_in_pcm16(
+                        frame.audio,
+                        sample_rate=frame.sample_rate,
+                        num_channels=frame.num_channels,
+                        fade_ms=TTS_PLAYBACK_FADE_IN_MS,
+                    )
+                    self._playback_started = True
+                else:
+                    audio_bytes = frame.audio
+
+                await asyncio.to_thread(stream.write, audio_bytes)
             except Exception as exc:
                 message = f"Live audio playback failed: {exc}"
                 self.errors.append(message)
@@ -160,6 +184,7 @@ class LiveAudioPlayer(FrameProcessor):
             await asyncio.to_thread(self._stream.stop)
             await asyncio.to_thread(self._stream.close)
             self._stream = None
+            self._playback_started = False
 
         await self.push_frame(frame, direction)
 
@@ -189,6 +214,33 @@ class ResultCollector(FrameProcessor):
                 self.audio_chunks.append(frame.audio)
         elif isinstance(frame, ErrorFrame):
             self.errors.append(frame.error)
+
+        await self.push_frame(frame, direction)
+
+
+class PipelineTerminator(FrameProcessor):
+    def __init__(self):
+        super().__init__(name="PipelineTerminator")
+        self._task: PipelineTask | None = None
+        self._tool_calls_in_progress = 0
+        self._end_queued = False
+
+    def bind_task(self, task: PipelineTask) -> None:
+        self._task = task
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, FunctionCallInProgressFrame):
+            self._tool_calls_in_progress += 1
+        elif isinstance(frame, FunctionCallResultFrame):
+            is_final = frame.properties.is_final if frame.properties is not None else True
+            if is_final:
+                self._tool_calls_in_progress = max(0, self._tool_calls_in_progress - 1)
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            if not self._end_queued and self._tool_calls_in_progress == 0 and self._task is not None:
+                self._end_queued = True
+                await self._task.queue_frame(EndFrame())
 
         await self.push_frame(frame, direction)
 
@@ -259,6 +311,30 @@ def extract_transcript_text(payload: str | dict) -> str:
     return str(payload.get("text", "")).strip()
 
 
+def resolve_runtime_models(args: argparse.Namespace) -> None:
+    args.model = resolve_model(
+        base_url=args.base_url,
+        api_key=args.api_key,
+        explicit_model=args.model,
+        capability="transcription",
+        fallback_model=asr_tools.ASR_MODEL_FALLBACK,
+    )
+    args.chat_model = resolve_model(
+        base_url=args.chat_base_url,
+        api_key=args.chat_api_key,
+        explicit_model=args.chat_model,
+        capability="chat",
+        fallback_model=tts_defaults.CHAT_MODEL_FALLBACK,
+    )
+    args.tts_model = resolve_model(
+        base_url=args.tts_base_url,
+        api_key=args.tts_api_key,
+        explicit_model=args.tts_model,
+        capability="speech",
+        fallback_model=tts_defaults.TTS_MODEL_FALLBACK,
+    )
+
+
 def build_llm_context(args: argparse.Namespace, transcript_text: str) -> LLMContext:
     return LLMContext(
         messages=[
@@ -298,6 +374,40 @@ def pcm16_to_float32(audio_bytes: bytes, num_channels: int) -> np.ndarray:
     if num_channels > 1:
         audio = audio.reshape(-1, num_channels)
     return audio.astype(np.float32) / 32768.0
+
+
+def silence_pcm16(*, sample_rate: int, num_channels: int, duration_ms: int) -> bytes:
+    if duration_ms <= 0 or sample_rate <= 0 or num_channels <= 0:
+        return b""
+
+    frame_count = max(1, int(round(sample_rate * duration_ms / 1000)))
+    return b"\x00\x00" * frame_count * num_channels
+
+
+def apply_fade_in_pcm16(audio_bytes: bytes, *, sample_rate: int, num_channels: int, fade_ms: int) -> bytes:
+    if fade_ms <= 0 or sample_rate <= 0 or num_channels <= 0 or not audio_bytes:
+        return audio_bytes
+
+    audio = np.frombuffer(audio_bytes, dtype=np.int16)
+    if audio.size == 0:
+        return audio_bytes
+
+    if num_channels > 1:
+        audio = audio.reshape(-1, num_channels)
+
+    frame_count = audio.shape[0]
+    fade_frames = min(frame_count, max(1, int(round(sample_rate * fade_ms / 1000))))
+    if fade_frames <= 0:
+        return audio_bytes
+
+    faded = audio.astype(np.float32, copy=True)
+    envelope = np.linspace(0.0, 1.0, num=fade_frames, endpoint=True, dtype=np.float32)
+    if num_channels > 1:
+        faded[:fade_frames, :] *= envelope[:, None]
+    else:
+        faded[:fade_frames] *= envelope
+
+    return np.clip(faded, -32768, 32767).astype(np.int16).tobytes()
 
 
 def write_wav_file(audio: SynthesizedAudio, output_path: Path) -> Path:
@@ -392,24 +502,16 @@ async def synthesize_audio_stream(args: argparse.Namespace, text: str):
 
 
 async def run_pipeline(args: argparse.Namespace, transcript_text: str) -> PipelineResult:
-    llm = OpenAILLMService(
-        api_key=args.chat_api_key,
-        base_url=args.chat_base_url,
-        settings=OpenAILLMService.Settings(
-            model=args.chat_model,
-            system_instruction=args.system_prompt,
-            temperature=args.llm_temperature,
-            max_completion_tokens=args.max_completion_tokens,
-            extra={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
-        ),
-    )
+    llm = LangGraphLLMProcessor(args)
     tts = LocalOpenAITTSProcessor(args)
     collector = ResultCollector()
+    terminator = PipelineTerminator()
     processors: list[FrameProcessor] = [llm, tts, collector]
     audio_player: LiveAudioPlayer | None = None
     if args.output_mode == "sound":
         audio_player = LiveAudioPlayer(args.playback_device)
         processors.append(audio_player)
+    processors.append(terminator)
     pipeline = Pipeline(processors)
     task = PipelineTask(
         pipeline,
@@ -419,10 +521,11 @@ async def run_pipeline(args: argparse.Namespace, transcript_text: str) -> Pipeli
         ),
         idle_timeout_secs=60,
     )
+    terminator.bind_task(task)
     runner = PipelineRunner()
 
     runner_task = asyncio.create_task(runner.run(task))
-    await task.queue_frames([LLMContextFrame(build_llm_context(args, transcript_text)), EndFrame()])
+    await task.queue_frame(LLMContextFrame(build_llm_context(args, transcript_text)))
     await runner_task
 
     if collector.errors:
@@ -451,6 +554,7 @@ async def main_async() -> int:
     args = parse_args()
 
     try:
+        resolve_runtime_models(args)
         payload, prepared_audio = await transcribe_input(args)
         transcript_output = asr_tools.save_output(payload, args, prepared_audio)
         transcript_text = extract_transcript_text(payload)

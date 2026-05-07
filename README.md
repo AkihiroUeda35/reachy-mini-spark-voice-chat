@@ -32,7 +32,7 @@ Runs the LLM server from the `llm-runtime` target.
 
 Runs Qwen3-TTS through `vllm-omni` from the `tts-runtime` target.
 
-- Default model: `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
+- Default model: `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`
 - Port: `8091`
 - GPU: required
 
@@ -41,7 +41,7 @@ Runs Qwen3-TTS through `vllm-omni` from the `tts-runtime` target.
 Runs the OpenAI-compatible wrapper from the `stt-runtime` target.
 
 - Port: `8020`
-- STT backend: Faster Whisper `large-v3-turbo` on GPU
+- STT backend: Faster Whisper `RoachLin/kotoba-whisper-v2.2-faster` on GPU
 - STT warmup: enabled on startup by default
 - TTS upstream: `http://qwen3-tts:8091`
 
@@ -141,6 +141,7 @@ TTS:
 
 Wrapper:
 
+- `STT_MODEL_ID`
 - `STT_MODEL_SIZE`
 - `STT_DEVICE`
 - `STT_COMPUTE_TYPE`
@@ -154,6 +155,7 @@ Wrapper:
 - `TTS_DEFAULT_TASK_TYPE`
 - `TTS_DEFAULT_LANGUAGE`
 - `TTS_DEFAULT_VOICE`
+- `TTS_PUBLIC_MODEL_NAME`
 
 ## Notes
 
@@ -161,3 +163,4 @@ Wrapper:
 - The LLM runtime still consumes wheels from [spark-vllm-docker/wheels](server/spark-vllm-docker/wheels) to match the Spark-tested vLLM stack.
 - The top-level Dockerfile copies wheel files from [spark-vllm-docker/wheels](server/spark-vllm-docker/wheels) by wildcard, so refreshed wheel versions from `spark-vllm-docker/build-and-copy.sh` do not require filename updates in [Dockerfile](server/Dockerfile).
 - First startup can take a long time because both the LLM and TTS models may need to download and initialize.
+- Local client tools auto-discover the current STT, chat, and TTS model IDs from each service's `/v1/models` endpoint unless you override them explicitly with environment variables or CLI flags.

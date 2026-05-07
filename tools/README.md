@@ -52,6 +52,7 @@ uv run python tools/whisper_asr_test.py --output data/custom_transcript.txt
 
 Use the local STT wrapper, the local OpenAI-compatible chat endpoint, and the local TTS wrapper in one script. The script accepts microphone input by default, can take an audio file instead, and can either play the generated reply through the default sound device or write it to a WAV file.
 In `sound` mode, the assistant starts speaking sentence by sentence while the LLM is still generating later tokens.
+Tool execution in this script is now handled through LangGraph. The current toolset includes a JMA weather lookup, so weather questions such as `長岡京市の天気を教えて` can trigger a live forecast lookup instead of a guessed answer.
 
 ```bash
 cd ..

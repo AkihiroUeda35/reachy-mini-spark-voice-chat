@@ -9,7 +9,7 @@ import os
 
 from huggingface_hub import snapshot_download
 
-model_id = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+model_id = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
 cache_dir = os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE")
 
 snapshot_download(
@@ -38,7 +38,7 @@ PY
 fi
 
 set -- \
-  vllm-omni serve "${QWEN_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice}" \
+  vllm-omni serve "${QWEN_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}" \
   --deploy-config "$DEPLOY_CONFIG" \
   --host "${QWEN_TTS_HOST:-0.0.0.0}" \
   --port "${QWEN_TTS_PORT:-8091}" \

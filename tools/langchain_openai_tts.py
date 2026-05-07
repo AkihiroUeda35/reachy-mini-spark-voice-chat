@@ -11,6 +11,7 @@ import httpx
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_deepseek import ChatDeepSeek
+from openai_model_registry import resolve_model
 from pydantic import SecretStr
 from websockets import connect as ws_connect
 
@@ -18,11 +19,13 @@ from websockets import connect as ws_connect
 BASE_DIR = Path(__file__).resolve().parent
 CHAT_BASE_URL = os.environ.get("CHAT_DEEPSEEK_BASE_URL", "http://localhost:8010/v1")
 CHAT_API_KEY = os.environ.get("CHAT_DEEPSEEK_API_KEY", "token-abc")
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "spark")
+CHAT_MODEL = os.environ.get("CHAT_MODEL")
+CHAT_MODEL_FALLBACK = os.environ.get("CHAT_MODEL_FALLBACK", "spark")
 TTS_BASE_URL = os.environ.get("TTS_BASE_URL", "http://localhost:8020/v1")
 TTS_API_KEY = os.environ.get("TTS_API_KEY", "local")
 VOICE = os.environ.get("TTS_VOICE", "Ono_Anna")
-TTS_MODEL = os.environ.get("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+TTS_MODEL = os.environ.get("TTS_MODEL")
+TTS_MODEL_FALLBACK = os.environ.get("TTS_MODEL_FALLBACK", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
 TTS_TASK_TYPE = os.environ.get("TTS_TASK_TYPE", "CustomVoice")
 TTS_LANGUAGE = os.environ.get("TTS_LANGUAGE", "Japanese")
 TTS_SAMPLE_RATE = int(os.environ.get("TTS_SAMPLE_RATE", "24000"))
@@ -35,6 +38,26 @@ OUT_DIR = BASE_DIR.parent / os.environ.get("TTS_OUTPUT_DIR", "data")
 OUT_PATH = OUT_DIR / os.environ.get("TTS_OUTPUT_NAME", "spark_voice_chat.wav")
 
 
+def resolve_chat_model() -> str:
+    return resolve_model(
+        base_url=CHAT_BASE_URL,
+        api_key=CHAT_API_KEY,
+        explicit_model=CHAT_MODEL,
+        capability="chat",
+        fallback_model=CHAT_MODEL_FALLBACK,
+    )
+
+
+def resolve_tts_model() -> str:
+    return resolve_model(
+        base_url=TTS_BASE_URL,
+        api_key=TTS_API_KEY,
+        explicit_model=TTS_MODEL,
+        capability="speech",
+        fallback_model=TTS_MODEL_FALLBACK,
+    )
+
+
 def _realtime_url() -> str:
     parsed = urlparse(TTS_BASE_URL)
     scheme = "wss" if parsed.scheme == "https" else "ws"
@@ -44,7 +67,7 @@ def _realtime_url() -> str:
 
 def _llm() -> ChatDeepSeek:
     return ChatDeepSeek(
-        model=CHAT_MODEL,
+        model=resolve_chat_model(),
         api_base=CHAT_BASE_URL,
         api_key=SecretStr(CHAT_API_KEY),
         temperature=0.2,
@@ -167,7 +190,7 @@ async def synthesize_realtime_streaming(topic: str) -> tuple[str, Path]:
                 {
                     "type": "session.update",
                     "session": {
-                        "model": TTS_MODEL,
+                        "model": resolve_tts_model(),
                         "voice": VOICE,
                         "instructions": TTS_INSTRUCTIONS,
                         "task_type": TTS_TASK_TYPE,
@@ -219,7 +242,7 @@ def synthesize(text: str) -> Path:
         f"{TTS_BASE_URL}/audio/speech",
         headers={"Authorization": f"Bearer {TTS_API_KEY}"},
         json={
-            "model": TTS_MODEL,
+            "model": resolve_tts_model(),
             "task_type": TTS_TASK_TYPE,
             "language": TTS_LANGUAGE,
             "voice": VOICE,
