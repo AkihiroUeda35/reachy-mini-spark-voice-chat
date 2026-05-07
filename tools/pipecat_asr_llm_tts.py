@@ -1,6 +1,8 @@
 import argparse
 import asyncio
+import base64
 import io
+import json
 import os
 import sys
 import wave
@@ -8,6 +10,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 import numpy as np
@@ -20,6 +23,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from websockets import connect as ws_connect
 
 import langchain_openai_tts as tts_defaults
 import whisper_asr_test as asr_tools
@@ -36,6 +40,7 @@ TTS_TIMEOUT = float(os.environ.get("TTS_TIMEOUT", "600"))
 TTS_STREAM_CHUNK_BYTES = int(os.environ.get("TTS_STREAM_CHUNK_BYTES", "8192"))
 TTS_PLAYBACK_LEAD_IN_MS = int(os.environ.get("TTS_PLAYBACK_LEAD_IN_MS", "5"))
 TTS_PLAYBACK_FADE_IN_MS = int(os.environ.get("TTS_PLAYBACK_FADE_IN_MS", "5"))
+TTS_TRANSPORT = os.environ.get("TTS_TRANSPORT", "realtime")
 
 
 @dataclass
@@ -74,16 +79,29 @@ class LocalOpenAITTSProcessor(FrameProcessor):
             return
 
         try:
-            while True:
-                segment = await self._segment_queue.get()
-                try:
-                    if segment is None:
-                        return
+            if self._args.tts_transport == "realtime":
+                async with open_tts_realtime_session(self._args) as websocket:
+                    while True:
+                        segment = await self._segment_queue.get()
+                        try:
+                            if segment is None:
+                                return
 
-                    async for audio_frame in synthesize_audio_stream(self._args, segment):
-                        await self.push_frame(audio_frame, direction)
-                finally:
-                    self._segment_queue.task_done()
+                            async for audio_frame in synthesize_realtime_audio_stream(self._args, websocket, segment):
+                                await self.push_frame(audio_frame, direction)
+                        finally:
+                            self._segment_queue.task_done()
+            else:
+                while True:
+                    segment = await self._segment_queue.get()
+                    try:
+                        if segment is None:
+                            return
+
+                        async for audio_frame in synthesize_audio_stream(self._args, segment):
+                            await self.push_frame(audio_frame, direction)
+                    finally:
+                        self._segment_queue.task_done()
         except Exception as exc:
             await self.push_frame(ErrorFrame(error=f"Streaming TTS failed: {exc}"), direction)
 
@@ -288,7 +306,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chat-model", default=tts_defaults.CHAT_MODEL, help="Chat model name.")
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT, help="System prompt sent to the LLM.")
     parser.add_argument("--llm-temperature", type=float, default=0.2, help="LLM sampling temperature.")
-    parser.add_argument("--max-completion-tokens", type=int, default=1000, help="Maximum completion tokens for the LLM response.")
+    parser.add_argument("--max-completion-tokens", type=int, default=3000, help="Maximum completion tokens for the LLM response.")
 
     parser.add_argument("--tts-base-url", default=tts_defaults.TTS_BASE_URL, help="OpenAI-compatible TTS base URL.")
     parser.add_argument("--tts-api-key", default=tts_defaults.TTS_API_KEY, help="Bearer token for the TTS endpoint.")
@@ -298,6 +316,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voice", default=tts_defaults.VOICE, help="Voice name sent to the TTS wrapper.")
     parser.add_argument("--tts-instructions", default=tts_defaults.TTS_INSTRUCTIONS, help="Instructions sent to the TTS wrapper.")
     parser.add_argument("--tts-sample-rate", type=int, default=tts_defaults.TTS_SAMPLE_RATE, help="Expected TTS sample rate.")
+    parser.add_argument(
+        "--tts-transport",
+        choices=["realtime", "http"],
+        default=TTS_TRANSPORT,
+        help="Transport used for TTS streaming. Defaults to realtime websocket.",
+    )
 
     parser.add_argument("--output-mode", choices=["sound", "file"], default="sound", help="Assistant audio destination. Defaults to local sound output.")
     parser.add_argument("--output-audio", help="Output WAV path when --output-mode file is used.")
@@ -347,6 +371,61 @@ def default_audio_output_path() -> Path:
     asr_tools.DATA_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return asr_tools.DATA_DIR / f"pipecat_reply_{timestamp}.wav"
+
+
+def tts_realtime_url(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    path = parsed.path.rstrip("/") + "/realtime"
+    return urlunparse((scheme, parsed.netloc, path, "", "", ""))
+
+
+async def wait_for_realtime_event(websocket, event_types: set[str]) -> dict:
+    while True:
+        payload = json.loads(await websocket.recv())
+        if payload.get("type") == "error":
+            detail = payload.get("error") or {}
+            raise RuntimeError(detail.get("message") or "Realtime TTS error")
+        if payload.get("type") in event_types:
+            return payload
+
+
+class RealtimeTTSSession:
+    def __init__(self, args: argparse.Namespace):
+        self._args = args
+        self._websocket = None
+
+    async def __aenter__(self):
+        self._websocket = await ws_connect(tts_realtime_url(self._args.tts_base_url), max_size=None)
+        payload = json.loads(await self._websocket.recv())
+        if payload.get("type") != "session.created":
+            raise RuntimeError(f"Unexpected realtime event: {payload}")
+
+        await self._websocket.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "model": self._args.tts_model,
+                        "voice": self._args.voice,
+                        "instructions": self._args.tts_instructions,
+                        "task_type": self._args.tts_task_type,
+                        "language": self._args.tts_language,
+                    },
+                }
+            )
+        )
+        await wait_for_realtime_event(self._websocket, {"session.updated"})
+        return self._websocket
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._websocket is not None:
+            await self._websocket.close()
+            self._websocket = None
+
+
+def open_tts_realtime_session(args: argparse.Namespace) -> RealtimeTTSSession:
+    return RealtimeTTSSession(args)
 
 
 def drain_ready_tts_segments(buffer: str, *, final: bool) -> tuple[list[str], str]:
@@ -499,6 +578,44 @@ async def synthesize_audio_stream(args: argparse.Namespace, text: str):
                         sample_rate=args.tts_sample_rate,
                         num_channels=1,
                     )
+
+
+async def synthesize_realtime_audio_stream(args: argparse.Namespace, websocket, text: str):
+    await websocket.send(
+        json.dumps(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }
+        )
+    )
+    await wait_for_realtime_event(websocket, {"conversation.item.created"})
+    await websocket.send(json.dumps({"type": "response.create"}))
+
+    while True:
+        payload = json.loads(await websocket.recv())
+        msg_type = payload.get("type")
+
+        if msg_type == "error":
+            detail = payload.get("error") or {}
+            raise RuntimeError(detail.get("message") or "Realtime TTS error")
+
+        if msg_type == "response.audio.delta":
+            delta = payload.get("delta") or ""
+            if delta:
+                yield OutputAudioRawFrame(
+                    audio=base64.b64decode(delta),
+                    sample_rate=args.tts_sample_rate,
+                    num_channels=1,
+                )
+            continue
+
+        if msg_type == "response.done":
+            return
 
 
 async def run_pipeline(args: argparse.Namespace, transcript_text: str) -> PipelineResult:
