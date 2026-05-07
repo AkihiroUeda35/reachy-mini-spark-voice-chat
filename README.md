@@ -6,16 +6,18 @@ Local voice stack for DGX Spark built around three services managed from the rep
 - Qwen3-TTS backend at `http://localhost:8091`
 - OpenAI-compatible STT/TTS wrapper at `http://localhost:8020/v1`
 
-The stack is started from the top-level [docker-compose.yml](server/docker-compose.yml) and built from the shared [Dockerfile](server/Dockerfile).
+The stack is started from the top-level [docker-compose.yml](docker-compose.yml) and built from the shared [Dockerfile](Dockerfile).
 
 ## Layout
 
-- [Dockerfile](server/Dockerfile): shared multi-stage build for `llm-runtime`, `tts-runtime`, and `stt-runtime`
-- [llm](server/llm): LLM runtime entrypoint and configuration wrapper
-- [tts](server/tts): Qwen3-TTS runtime entrypoint, models, and voices
-- [stt](server/stt): FastAPI wrapper, STT app code, and STT model cache
-- [tools](server/tools): local smoke-test and sample scripts
-- [spark-vllm-docker](server/spark-vllm-docker): upstream helper repo kept for wheels and Spark-specific vLLM assets
+- [Dockerfile](Dockerfile): shared multi-stage build for `llm-runtime`, `tts-runtime`, and `stt-runtime`
+- [llm](llm): LLM runtime entrypoint and configuration wrapper
+- [tts](tts): Qwen3-TTS runtime entrypoint, models, and voices
+- [stt](stt): FastAPI wrapper, STT app code, and STT model cache
+- [lib](lib): reusable STT/LLM/TTS client modules
+- [samples](samples): local smoke-test and sample entry points built on top of `lib`
+- [apps](apps): planned application entry points such as a Reachy Mini app
+- [spark-vllm-docker](spark-vllm-docker): upstream helper repo kept for wheels and Spark-specific vLLM assets
 
 ## Services
 
@@ -102,25 +104,42 @@ curl http://localhost:8020/health
 
 ## Local Sample
 
-The sample script in [tools/langchain_openai_tts.py](server/tools/langchain_openai_tts.py) generates a short Japanese script with the local LLM, sends it to the local TTS wrapper, and writes a WAV file.
+The sample script in [samples/langchain_openai_tts.py](samples/langchain_openai_tts.py) generates a short Japanese script with the local LLM, sends it to the local TTS wrapper, and writes a WAV file. Shared client code lives in [lib](lib), so future apps can reuse the same STT/LLM/TTS access layer directly.
+
+Install the local environment first. `uv sync` now installs this repository as an editable package, so `lib` can be imported without extra path hacks.
+
+```bash
+uv sync
+```
+
+If you already have the environment and only want to refresh the editable install, this is equivalent.
+
+```bash
+uv pip install -e .
+```
+
+If you want local script defaults from a file, create a root `.env`. That file is loaded by script entry points such as `samples/*.py`; `lib` itself does not auto-load it.
+
+```bash
+cp .env.example .env
+```
 
 Install local dependencies and run it from the repository root.
 
 ```bash
-uv sync
-uv run python tools/langchain_openai_tts.py
+uv run python samples/langchain_openai_tts.py
 ```
 
 Default output:
 
-- [data/spark_voice_chat.wav](server/data/spark_voice_chat.wav)
+- [data/spark_voice_chat.wav](data/spark_voice_chat.wav)
 
 ## Main Runtime Data
 
 - LLM/HF cache: `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, `~/.triton`
-- TTS model cache: [tts/models](server/tts/models)
-- STT model cache: [stt/models](server/stt/models)
-- Voice definitions: [tts/voices/voices.json](server/tts/voices/voices.json)
+- TTS model cache: [tts/models](tts/models)
+- STT model cache: [stt/models](stt/models)
+- Voice definitions: [tts/voices/voices.json](tts/voices/voices.json)
 
 ## Important Environment Variables
 
@@ -157,10 +176,23 @@ Wrapper:
 - `TTS_DEFAULT_VOICE`
 - `TTS_PUBLIC_MODEL_NAME`
 
+Script entry point layer:
+
+- `LLM_SERVER_URL`
+- `STT_SERVER_URL`
+- `TTS_SERVER_URL`
+- `CHAT_API_KEY`
+- `ASR_API_KEY`
+- `TTS_API_KEY`
+- `ASR_LANGUAGE`
+- `ASR_TRANSPORT`
+- `TTS_USE_REALTIME_STREAMING`
+
 ## Notes
 
 - The shared top-level Dockerfile keeps the build flow unified, but `llm-runtime` and `tts-runtime` remain separate targets because their runtime dependencies differ.
-- The LLM runtime still consumes wheels from [spark-vllm-docker/wheels](server/spark-vllm-docker/wheels) to match the Spark-tested vLLM stack.
-- The top-level Dockerfile copies wheel files from [spark-vllm-docker/wheels](server/spark-vllm-docker/wheels) by wildcard, so refreshed wheel versions from `spark-vllm-docker/build-and-copy.sh` do not require filename updates in [Dockerfile](server/Dockerfile).
+- The LLM runtime still consumes wheels from [spark-vllm-docker/wheels](spark-vllm-docker/wheels) to match the Spark-tested vLLM stack.
+- The top-level Dockerfile copies wheel files from [spark-vllm-docker/wheels](spark-vllm-docker/wheels) by wildcard, so refreshed wheel versions from `spark-vllm-docker/build-and-copy.sh` do not require filename updates in [Dockerfile](Dockerfile).
 - First startup can take a long time because both the LLM and TTS models may need to download and initialize.
-- Local client tools auto-discover the current STT, chat, and TTS model IDs from each service's `/v1/models` endpoint unless you override them explicitly with environment variables or CLI flags.
+- Local client samples auto-discover the current STT, chat, and TTS model IDs from each service's `/v1/models` endpoint unless you override them explicitly with environment variables or CLI flags.
+- `.env` loading is intentionally limited to script entry points. Reusable modules under [lib](lib) read only the process environment they are given.

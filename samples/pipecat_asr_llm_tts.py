@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import base64
 import io
+import importlib
 import json
 import os
 import sys
@@ -15,8 +16,6 @@ from urllib.parse import urlparse, urlunparse
 import httpx
 import numpy as np
 import soundfile as sf
-from langgraph_agent import LangGraphLLMProcessor
-from openai_model_registry import resolve_model
 from pipecat.frames.frames import EndFrame, ErrorFrame, FunctionCallInProgressFrame, FunctionCallResultFrame, LLMContextFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame, OutputAudioRawFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -25,8 +24,33 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from websockets import connect as ws_connect
 
-import langchain_openai_tts as tts_defaults
-import whisper_asr_test as asr_tools
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+importlib.import_module("lib.config").load_env()
+
+_langgraph_agent = importlib.import_module("lib.langgraph_agent")
+_local_tts = importlib.import_module("lib.local_tts")
+_openai_model_registry = importlib.import_module("lib.openai_model_registry")
+asr_tools = importlib.import_module("lib.whisper_asr")
+
+LangGraphLLMProcessor = _langgraph_agent.LangGraphLLMProcessor
+CHAT_API_KEY = _local_tts.CHAT_API_KEY
+CHAT_BASE_URL = _local_tts.CHAT_BASE_URL
+CHAT_MODEL = _local_tts.CHAT_MODEL
+CHAT_MODEL_FALLBACK = _local_tts.CHAT_MODEL_FALLBACK
+TTS_API_KEY = _local_tts.TTS_API_KEY
+TTS_BASE_URL = _local_tts.TTS_BASE_URL
+TTS_INSTRUCTIONS = _local_tts.TTS_INSTRUCTIONS
+TTS_LANGUAGE = _local_tts.TTS_LANGUAGE
+TTS_MODEL = _local_tts.TTS_MODEL
+TTS_MODEL_FALLBACK = _local_tts.TTS_MODEL_FALLBACK
+TTS_SAMPLE_RATE = _local_tts.TTS_SAMPLE_RATE
+TTS_TASK_TYPE = _local_tts.TTS_TASK_TYPE
+VOICE = _local_tts.VOICE
+resolve_model = _openai_model_registry.resolve_model
+
 
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -301,21 +325,21 @@ def parse_args() -> argparse.Namespace:
         help="Save the transcription result to a file.",
     )
 
-    parser.add_argument("--chat-base-url", default=tts_defaults.CHAT_BASE_URL, help="OpenAI-compatible chat base URL.")
-    parser.add_argument("--chat-api-key", default=tts_defaults.CHAT_API_KEY, help="Bearer token for the chat endpoint.")
-    parser.add_argument("--chat-model", default=tts_defaults.CHAT_MODEL, help="Chat model name.")
+    parser.add_argument("--chat-base-url", default=CHAT_BASE_URL, help="OpenAI-compatible chat base URL.")
+    parser.add_argument("--chat-api-key", default=CHAT_API_KEY, help="Bearer token for the chat endpoint.")
+    parser.add_argument("--chat-model", default=CHAT_MODEL, help="Chat model name.")
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT, help="System prompt sent to the LLM.")
     parser.add_argument("--llm-temperature", type=float, default=0.2, help="LLM sampling temperature.")
     parser.add_argument("--max-completion-tokens", type=int, default=3000, help="Maximum completion tokens for the LLM response.")
 
-    parser.add_argument("--tts-base-url", default=tts_defaults.TTS_BASE_URL, help="OpenAI-compatible TTS base URL.")
-    parser.add_argument("--tts-api-key", default=tts_defaults.TTS_API_KEY, help="Bearer token for the TTS endpoint.")
-    parser.add_argument("--tts-model", default=tts_defaults.TTS_MODEL, help="TTS model name.")
-    parser.add_argument("--tts-task-type", default=tts_defaults.TTS_TASK_TYPE, help="Task type sent to the TTS wrapper.")
-    parser.add_argument("--tts-language", default=tts_defaults.TTS_LANGUAGE, help="Language sent to the TTS wrapper.")
-    parser.add_argument("--voice", default=tts_defaults.VOICE, help="Voice name sent to the TTS wrapper.")
-    parser.add_argument("--tts-instructions", default=tts_defaults.TTS_INSTRUCTIONS, help="Instructions sent to the TTS wrapper.")
-    parser.add_argument("--tts-sample-rate", type=int, default=tts_defaults.TTS_SAMPLE_RATE, help="Expected TTS sample rate.")
+    parser.add_argument("--tts-base-url", default=TTS_BASE_URL, help="OpenAI-compatible TTS base URL.")
+    parser.add_argument("--tts-api-key", default=TTS_API_KEY, help="Bearer token for the TTS endpoint.")
+    parser.add_argument("--tts-model", default=TTS_MODEL, help="TTS model name.")
+    parser.add_argument("--tts-task-type", default=TTS_TASK_TYPE, help="Task type sent to the TTS wrapper.")
+    parser.add_argument("--tts-language", default=TTS_LANGUAGE, help="Language sent to the TTS wrapper.")
+    parser.add_argument("--voice", default=VOICE, help="Voice name sent to the TTS wrapper.")
+    parser.add_argument("--tts-instructions", default=TTS_INSTRUCTIONS, help="Instructions sent to the TTS wrapper.")
+    parser.add_argument("--tts-sample-rate", type=int, default=TTS_SAMPLE_RATE, help="Expected TTS sample rate.")
     parser.add_argument(
         "--tts-transport",
         choices=["realtime", "http"],
@@ -348,14 +372,14 @@ def resolve_runtime_models(args: argparse.Namespace) -> None:
         api_key=args.chat_api_key,
         explicit_model=args.chat_model,
         capability="chat",
-        fallback_model=tts_defaults.CHAT_MODEL_FALLBACK,
+        fallback_model=CHAT_MODEL_FALLBACK,
     )
     args.tts_model = resolve_model(
         base_url=args.tts_base_url,
         api_key=args.tts_api_key,
         explicit_model=args.tts_model,
         capability="speech",
-        fallback_model=tts_defaults.TTS_MODEL_FALLBACK,
+        fallback_model=TTS_MODEL_FALLBACK,
     )
 
 
@@ -510,7 +534,7 @@ def play_audio(audio: SynthesizedAudio, device: str | None) -> None:
     sd.wait()
 
 
-async def transcribe_input(args: argparse.Namespace) -> tuple[str | dict, asr_tools.PreparedAudio]:
+async def transcribe_input(args: argparse.Namespace) -> tuple[str | dict, "PreparedAudio"]:
     if args.transport == "realtime" and (args.microphone or not args.file):
         return await asr_tools.transcribe_realtime_microphone(args)
 

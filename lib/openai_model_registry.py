@@ -6,7 +6,8 @@ from typing import Any
 import httpx
 
 
-MODELS_TIMEOUT = float(os.environ.get("OPENAI_MODELS_TIMEOUT", "10"))
+def _models_timeout() -> float:
+    return float(os.environ.get("OPENAI_MODELS_TIMEOUT", "10"))
 
 
 def _models_url(base_url: str) -> str:
@@ -20,7 +21,7 @@ def _headers(api_key: str | None) -> dict[str, str]:
 
 
 def fetch_models(base_url: str, api_key: str | None = None) -> list[dict[str, Any]]:
-    response = httpx.get(_models_url(base_url), headers=_headers(api_key), timeout=MODELS_TIMEOUT)
+    response = httpx.get(_models_url(base_url), headers=_headers(api_key), timeout=_models_timeout())
     response.raise_for_status()
     payload = response.json()
     models = payload.get("data") if isinstance(payload, dict) else None

@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import argparse
 import asyncio
 import base64
-import math
 import json
+import math
 import mimetypes
 import os
 import struct
@@ -19,12 +21,11 @@ import numpy as np
 import soundfile as sf
 from websockets import connect as ws_connect
 
-from openai_model_registry import resolve_model
+from lib.config import project_root, service_url
+from lib.openai_model_registry import resolve_model
 
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR.parent / os.environ.get("ASR_OUTPUT_DIR", "data")
-ASR_BASE_URL = os.environ.get("ASR_BASE_URL", "http://localhost:8020/v1").rstrip("/")
+DATA_DIR = project_root() / os.environ.get("ASR_OUTPUT_DIR", "data")
+ASR_BASE_URL = service_url("stt", "http://localhost:8020/v1")
 ASR_API_KEY = os.environ.get("ASR_API_KEY", "local")
 ASR_MODEL = os.environ.get("ASR_MODEL")
 ASR_MODEL_FALLBACK = os.environ.get("ASR_MODEL_FALLBACK", "whisper-1")
@@ -603,7 +604,3 @@ def main() -> int:
     if output_path is not None:
         print(f"saved: {output_path}", file=sys.stderr)
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

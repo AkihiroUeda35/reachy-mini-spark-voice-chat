@@ -4,19 +4,16 @@ import argparse
 from datetime import datetime
 from typing import Any, cast
 
-from langchain_deepseek import ChatDeepSeek
 from langchain_core.messages import AIMessageChunk, SystemMessage
 from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import SecretStr
 from pipecat.frames.frames import ErrorFrame, LLMContextFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-try:
-    from jma_weather_tool import get_jma_weather_tool
-except ModuleNotFoundError:
-    from tools.jma_weather_tool import get_jma_weather_tool
+from lib.jma_weather_tool import get_jma_weather_tool
 
 
 @tool

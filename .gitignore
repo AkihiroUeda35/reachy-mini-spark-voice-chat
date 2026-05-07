@@ -2,10 +2,11 @@
 .triton_cache/
 .DS_Store
 ._*
-tools/.venv/
+samples/.venv/
 data/*
 __pycache__/
 *.pyc
 
 */models/*
 */voices/*
+spark_voice_chat.egg-info/*

@@ -69,7 +69,7 @@ services:
     depends_on:
       - qwen3-tts
     ports:
-      - "8020:8020"
+      - "${VOICE_SERVER_PORT:-8020}:8020"
     gpus: all
     environment:
       STT_MODEL_SIZE: ${STT_MODEL_SIZE:-RoachLin/kotoba-whisper-v2.2-faster}

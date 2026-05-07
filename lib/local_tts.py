@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import json
@@ -11,17 +13,17 @@ import httpx
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_deepseek import ChatDeepSeek
-from openai_model_registry import resolve_model
 from pydantic import SecretStr
 from websockets import connect as ws_connect
 
+from lib.config import project_root, service_url
+from lib.openai_model_registry import resolve_model
 
-BASE_DIR = Path(__file__).resolve().parent
-CHAT_BASE_URL = os.environ.get("CHAT_DEEPSEEK_BASE_URL", "http://localhost:8010/v1")
-CHAT_API_KEY = os.environ.get("CHAT_DEEPSEEK_API_KEY", "token-abc")
+CHAT_BASE_URL = service_url("llm", "http://localhost:8010/v1")
+CHAT_API_KEY = os.environ.get("CHAT_API_KEY", os.environ.get("CHAT_DEEPSEEK_API_KEY", "token-abc"))
 CHAT_MODEL = os.environ.get("CHAT_MODEL")
 CHAT_MODEL_FALLBACK = os.environ.get("CHAT_MODEL_FALLBACK", "spark")
-TTS_BASE_URL = os.environ.get("TTS_BASE_URL", "http://localhost:8020/v1")
+TTS_BASE_URL = service_url("tts", "http://localhost:8020/v1")
 TTS_API_KEY = os.environ.get("TTS_API_KEY", "local")
 VOICE = os.environ.get("TTS_VOICE", "Ono_Anna")
 TTS_MODEL = os.environ.get("TTS_MODEL")
@@ -34,7 +36,7 @@ TTS_INSTRUCTIONS = os.environ.get(
     "TTS_INSTRUCTIONS",
     "Speak in natural standard Japanese with a bright, lively tone and clean articulation.",
 )
-OUT_DIR = BASE_DIR.parent / os.environ.get("TTS_OUTPUT_DIR", "data")
+OUT_DIR = project_root() / os.environ.get("TTS_OUTPUT_DIR", "data")
 OUT_PATH = OUT_DIR / os.environ.get("TTS_OUTPUT_NAME", "spark_voice_chat.wav")
 
 
@@ -115,24 +117,23 @@ def _drain_ready_segments(buffer: str, *, final: bool) -> tuple[list[str], str]:
     return segments, remainder
 
 
-
-# Dictionary for specific kanji to hiragana conversion
 KANJI_TO_HIRAGANA = {
     "清水": "きよみず",
     "祇園": "ぎおん",
     "竹林": "ちくりん",
 }
 
+
 def convert_kanji_to_hiragana(text: str) -> str:
     for kanji, hira in KANJI_TO_HIRAGANA.items():
         text = text.replace(kanji, hira)
     return text
 
+
 def build_script(topic: str) -> str:
     chain = _script_chain()
     script = chain.invoke({"topic": topic}).strip()
     return convert_kanji_to_hiragana(script)
-
 
 
 def stream_script(topic: str):
@@ -270,7 +271,3 @@ def main() -> None:
     print(f"script: {script}")
     output_path = synthesize(script)
     print(f"audio: {output_path}")
-
-
-if __name__ == "__main__":
-    main()
