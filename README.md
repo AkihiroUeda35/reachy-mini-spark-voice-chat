@@ -41,7 +41,7 @@ Runs Qwen3-TTS through `vllm-omni` from the `tts-runtime` target.
 Runs the OpenAI-compatible wrapper from the `stt-runtime` target.
 
 - Port: `8020`
-- STT backend: Faster Whisper on CPU by default
+- STT backend: Faster Whisper `large-v3-turbo` on CPU by default
 - TTS upstream: `http://qwen3-tts:8091`
 
 ## Requirements
@@ -143,6 +143,12 @@ Wrapper:
 - `STT_MODEL_SIZE`
 - `STT_DEVICE`
 - `STT_COMPUTE_TYPE`
+- `STT_CPU_THREADS`
+- `STT_NUM_WORKERS`
+- `STT_DEFAULT_LANGUAGE`
+- `STT_BEAM_SIZE`
+- `STT_BEST_OF`
+- `STT_CONDITION_ON_PREVIOUS_TEXT`
 - `TTS_DEFAULT_TASK_TYPE`
 - `TTS_DEFAULT_LANGUAGE`
 - `TTS_DEFAULT_VOICE`
@@ -151,4 +157,5 @@ Wrapper:
 
 - The shared top-level Dockerfile keeps the build flow unified, but `llm-runtime` and `tts-runtime` remain separate targets because their runtime dependencies differ.
 - The LLM runtime still consumes wheels from [spark-vllm-docker/wheels](server/spark-vllm-docker/wheels) to match the Spark-tested vLLM stack.
+- The top-level Dockerfile copies wheel files from [spark-vllm-docker/wheels](server/spark-vllm-docker/wheels) by wildcard, so refreshed wheel versions from `spark-vllm-docker/build-and-copy.sh` do not require filename updates in [Dockerfile](server/Dockerfile).
 - First startup can take a long time because both the LLM and TTS models may need to download and initialize.

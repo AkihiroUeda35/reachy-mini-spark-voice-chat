@@ -25,6 +25,7 @@ app = FastAPI(title="OpenAI-compatible Qwen3-TTS + Faster Whisper Server")
 
 _stt_model: WhisperModel | None = None
 _stt_lock = threading.Lock()
+_tts_warmup_task: asyncio.Task[None] | None = None
 
 logger = logging.getLogger("tts")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -36,13 +37,64 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default).strip() or default
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value.strip())
+    except ValueError:
+        return default
+    return parsed if parsed >= 1 else default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _stt_default_language() -> str | None:
+    value = os.environ.get("STT_DEFAULT_LANGUAGE", "").strip()
+    if not value or value.lower() == "auto":
+        return None
+    return value
+
+
+def _stt_beam_size() -> int:
+    return _env_int("STT_BEAM_SIZE", 1)
+
+
+def _stt_best_of() -> int:
+    return _env_int("STT_BEST_OF", 1)
+
+
+def _stt_condition_on_previous_text() -> bool:
+    return _env_bool("STT_CONDITION_ON_PREVIOUS_TEXT", False)
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
-    global _tts_warmup_started
+    global _tts_warmup_started, _tts_warmup_task
     if _tts_warmup_started:
         return
     _tts_warmup_started = True
-    await _warmup_tts_upstream()
+    _tts_warmup_task = asyncio.create_task(_warmup_tts_upstream())
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    global _tts_warmup_task
+    if _tts_warmup_task is None or _tts_warmup_task.done():
+        return
+    _tts_warmup_task.cancel()
+    try:
+        await _tts_warmup_task
+    except asyncio.CancelledError:
+        logger.info("Cancelled pending TTS warmup task during shutdown")
+    finally:
+        _tts_warmup_task = None
 
 
 def get_stt_model() -> WhisperModel:
@@ -50,10 +102,33 @@ def get_stt_model() -> WhisperModel:
     if _stt_model is None:
         with _stt_lock:
             if _stt_model is None:
+                stt_model_size = _env("STT_MODEL_SIZE", "large-v3-turbo")
+                stt_device = _env("STT_DEVICE", "cpu")
+                stt_compute_type = _env("STT_COMPUTE_TYPE", "int8")
+                stt_cpu_threads = _env_int("STT_CPU_THREADS", 8)
+                stt_num_workers = _env_int("STT_NUM_WORKERS", 1)
+                stt_default_language = _stt_default_language() or "auto"
+                stt_beam_size = _stt_beam_size()
+                stt_best_of = _stt_best_of()
+                stt_condition_on_previous_text = _stt_condition_on_previous_text()
+                logger.info(
+                    "Loading Faster Whisper model=%s device=%s compute_type=%s cpu_threads=%s num_workers=%s default_language=%s beam_size=%s best_of=%s condition_on_previous_text=%s",
+                    stt_model_size,
+                    stt_device,
+                    stt_compute_type,
+                    stt_cpu_threads,
+                    stt_num_workers,
+                    stt_default_language,
+                    stt_beam_size,
+                    stt_best_of,
+                    stt_condition_on_previous_text,
+                )
                 _stt_model = WhisperModel(
-                    _env("STT_MODEL_SIZE", "base"),
-                    device=_env("STT_DEVICE", "cpu"),
-                    compute_type=_env("STT_COMPUTE_TYPE", "int8"),
+                    stt_model_size,
+                    device=stt_device,
+                    compute_type=stt_compute_type,
+                    cpu_threads=stt_cpu_threads,
+                    num_workers=stt_num_workers,
                     download_root=_env("STT_DOWNLOAD_ROOT", "/models/faster-whisper"),
                 )
     return _stt_model
@@ -137,6 +212,67 @@ def _wav_header(sample_rate: int, data_len: int = 0xFFFFFFFF) -> bytes:
 def _complete_wav(audio: np.ndarray, sample_rate: int) -> bytes:
     raw = _to_pcm16(audio)
     return _wav_header(sample_rate, len(raw)) + raw
+
+
+def _audio_bytes_from_realtime_input(audio_buffer: bytes, audio_format: str, sample_rate: int) -> tuple[bytes, str]:
+    if audio_format == "pcm16":
+        return _wav_header(sample_rate, len(audio_buffer)) + audio_buffer, ".wav"
+    if audio_format == "wav":
+        return audio_buffer, ".wav"
+    raise HTTPException(status_code=400, detail=f"Unsupported realtime input_audio_format: {audio_format}")
+
+
+def _transcription_segment(segment: Any, *, word_timestamps: bool) -> dict[str, Any]:
+    item = {
+        "id": segment.id,
+        "seek": segment.seek,
+        "start": segment.start,
+        "end": segment.end,
+        "text": segment.text,
+        "tokens": segment.tokens,
+        "temperature": segment.temperature,
+        "avg_logprob": segment.avg_logprob,
+        "compression_ratio": segment.compression_ratio,
+        "no_speech_prob": segment.no_speech_prob,
+    }
+    if word_timestamps and segment.words:
+        item["words"] = [
+            {"start": w.start, "end": w.end, "word": w.word, "probability": w.probability}
+            for w in segment.words
+        ]
+    return item
+
+
+def _transcribe_audio_bytes(
+    audio_bytes: bytes,
+    *,
+    suffix: str,
+    language: str | None,
+    prompt: str | None,
+    temperature: float,
+    word_timestamps: bool,
+) -> tuple[str, list[dict[str, Any]], Any]:
+    effective_language = language or _stt_default_language()
+    with tempfile.NamedTemporaryFile(suffix=suffix or ".wav", delete=True) as tmp:
+        tmp.write(audio_bytes)
+        tmp.flush()
+        segments_iter, info = get_stt_model().transcribe(
+            tmp.name,
+            language=effective_language,
+            initial_prompt=prompt,
+            temperature=temperature,
+            word_timestamps=word_timestamps,
+            beam_size=_stt_beam_size(),
+            best_of=_stt_best_of(),
+            condition_on_previous_text=_stt_condition_on_previous_text(),
+        )
+        segments = []
+        text_parts = []
+        for segment in segments_iter:
+            segments.append(_transcription_segment(segment, word_timestamps=word_timestamps))
+            text_parts.append(segment.text)
+
+    return "".join(text_parts).strip(), segments, info
 
 
 def _mp3_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
@@ -390,6 +526,14 @@ class RealtimeSession(BaseModel):
     input_text: str = ""
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] = Field(default_factory=_default_task_type)
     language: str = Field(default_factory=lambda: _env("TTS_DEFAULT_LANGUAGE", _env("QWEN_TTS_DEFAULT_LANGUAGE", "Japanese")))
+    transcription_model: str = "whisper-1"
+    input_audio_transcription: bool = False
+    input_audio_format: Literal["pcm16", "wav"] = "pcm16"
+    input_audio_sample_rate: int = Field(default=16000, ge=1)
+    transcription_language: str = ""
+    transcription_prompt: str = ""
+    transcription_response_format: Literal["text", "json", "verbose_json"] = "text"
+    transcription_word_timestamps: bool = False
 
 
 def _tts_request_payload(
@@ -457,6 +601,8 @@ async def _warmup_tts_upstream() -> None:
     if not _tts_warmup_enabled():
         logger.info("TTS upstream warmup disabled")
         return
+
+    logger.info("Starting TTS upstream warmup in background")
 
     for _attempt in range(60):
         if await _tts_health():
@@ -575,42 +721,17 @@ async def create_transcription(
     suffix = Path(file.filename or "audio.wav").suffix or ".wav"
     word_timestamps = bool(timestamp_granularities and "word" in timestamp_granularities)
     try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
-            tmp.write(await file.read())
-            tmp.flush()
-            segments_iter, info = get_stt_model().transcribe(
-                tmp.name,
-                language=language or None,
-                initial_prompt=prompt,
-                temperature=temperature,
-                word_timestamps=word_timestamps,
-            )
-            segments = []
-            text_parts = []
-            for segment in segments_iter:
-                item = {
-                    "id": segment.id,
-                    "seek": segment.seek,
-                    "start": segment.start,
-                    "end": segment.end,
-                    "text": segment.text,
-                    "tokens": segment.tokens,
-                    "temperature": segment.temperature,
-                    "avg_logprob": segment.avg_logprob,
-                    "compression_ratio": segment.compression_ratio,
-                    "no_speech_prob": segment.no_speech_prob,
-                }
-                if word_timestamps and segment.words:
-                    item["words"] = [
-                        {"start": w.start, "end": w.end, "word": w.word, "probability": w.probability}
-                        for w in segment.words
-                    ]
-                segments.append(item)
-                text_parts.append(segment.text)
+        text, segments, info = _transcribe_audio_bytes(
+            await file.read(),
+            suffix=suffix,
+            language=language,
+            prompt=prompt,
+            temperature=temperature,
+            word_timestamps=word_timestamps,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    text = "".join(text_parts).strip()
     if response_format == "text":
         return PlainTextResponse(text)
     if response_format == "verbose_json":
@@ -684,6 +805,8 @@ async def create_speech(req: SpeechRequest):
 async def realtime_socket(websocket: WebSocket):
     await websocket.accept()
     session = RealtimeSession()
+    input_audio_buffer = bytearray()
+    input_audio_item_id: str | None = None
 
     await websocket.send_json(
         {
@@ -710,11 +833,85 @@ async def realtime_socket(websocket: WebSocket):
                     session.task_type = payload["task_type"]
                 if isinstance(payload.get("language"), str) and payload["language"].strip():
                     session.language = payload["language"].strip()
+                if payload.get("input_audio_transcription") is False:
+                    session.input_audio_transcription = False
+                elif isinstance(payload.get("input_audio_transcription"), bool):
+                    session.input_audio_transcription = payload["input_audio_transcription"]
+                elif isinstance(payload.get("input_audio_transcription"), dict):
+                    transcription = payload["input_audio_transcription"]
+                    session.input_audio_transcription = True
+                    if isinstance(transcription.get("model"), str) and transcription["model"].strip():
+                        session.transcription_model = transcription["model"].strip()
+                    if isinstance(transcription.get("language"), str):
+                        session.transcription_language = transcription["language"].strip()
+                    if isinstance(transcription.get("prompt"), str):
+                        session.transcription_prompt = transcription["prompt"]
+                    if transcription.get("response_format") in {"text", "json", "verbose_json"}:
+                        session.transcription_response_format = transcription["response_format"]
+                    granularities = transcription.get("timestamp_granularities")
+                    if isinstance(granularities, list):
+                        session.transcription_word_timestamps = "word" in granularities
+                if payload.get("input_audio_format") in {"pcm16", "wav"}:
+                    session.input_audio_format = payload["input_audio_format"]
+                sample_rate = payload.get("input_audio_sample_rate")
+                if isinstance(sample_rate, int) and sample_rate >= 1:
+                    session.input_audio_sample_rate = sample_rate
                 await websocket.send_json(
                     {
                         "type": "session.updated",
                         "event_id": _realtime_event_id(),
                         "session": session.model_dump(),
+                    }
+                )
+                continue
+
+            if msg_type == "input_audio_buffer.append":
+                audio_chunk = message.get("audio")
+                if not isinstance(audio_chunk, str) or not audio_chunk:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "event_id": _realtime_event_id(),
+                            "error": {"type": "invalid_request_error", "message": "Missing realtime audio chunk."},
+                        }
+                    )
+                    continue
+                try:
+                    input_audio_buffer.extend(base64.b64decode(audio_chunk))
+                except ValueError:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "event_id": _realtime_event_id(),
+                            "error": {"type": "invalid_request_error", "message": "Invalid base64 audio chunk."},
+                        }
+                    )
+                    continue
+                input_audio_item_id = input_audio_item_id or _item_id()
+                continue
+
+            if msg_type == "input_audio_buffer.clear":
+                input_audio_buffer.clear()
+                input_audio_item_id = None
+                await websocket.send_json({"type": "input_audio_buffer.cleared", "event_id": _realtime_event_id()})
+                continue
+
+            if msg_type == "input_audio_buffer.commit":
+                if not input_audio_buffer:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "event_id": _realtime_event_id(),
+                            "error": {"type": "invalid_request_error", "message": "No audio buffered for transcription."},
+                        }
+                    )
+                    continue
+                input_audio_item_id = input_audio_item_id or _item_id()
+                await websocket.send_json(
+                    {
+                        "type": "input_audio_buffer.committed",
+                        "event_id": _realtime_event_id(),
+                        "item_id": input_audio_item_id,
                     }
                 )
                 continue
@@ -733,6 +930,171 @@ async def realtime_socket(websocket: WebSocket):
                 continue
 
             if msg_type == "response.create":
+                if session.input_audio_transcription or input_audio_buffer:
+                    if not input_audio_buffer:
+                        await websocket.send_json(
+                            {
+                                "type": "error",
+                                "event_id": _realtime_event_id(),
+                                "error": {"type": "invalid_request_error", "message": "No input audio provided for transcription."},
+                            }
+                        )
+                        continue
+
+                    response_id = _response_id()
+                    output_item_id = _item_id()
+                    input_audio_item_id = input_audio_item_id or _item_id()
+                    response = message.get("response") or {}
+                    prompt = session.transcription_prompt
+                    if isinstance(response.get("instructions"), str) and response["instructions"].strip():
+                        prompt = response["instructions"].strip()
+
+                    await websocket.send_json(
+                        {
+                            "type": "response.created",
+                            "event_id": _realtime_event_id(),
+                            "response": {
+                                "id": response_id,
+                                "object": "realtime.response",
+                                "status": "in_progress",
+                                "output": [],
+                            },
+                        }
+                    )
+
+                    try:
+                        audio_bytes, suffix = _audio_bytes_from_realtime_input(
+                            bytes(input_audio_buffer),
+                            session.input_audio_format,
+                            session.input_audio_sample_rate,
+                        )
+                        text, segments, info = _transcribe_audio_bytes(
+                            audio_bytes,
+                            suffix=suffix,
+                            language=session.transcription_language or None,
+                            prompt=prompt or None,
+                            temperature=0,
+                            word_timestamps=session.transcription_word_timestamps,
+                        )
+
+                        await websocket.send_json(
+                            {
+                                "type": "conversation.item.created",
+                                "event_id": _realtime_event_id(),
+                                "item": {
+                                    "id": input_audio_item_id,
+                                    "type": "message",
+                                    "role": "user",
+                                    "status": "completed",
+                                    "content": [{"type": "input_audio", "audio": ""}],
+                                },
+                            }
+                        )
+                        await websocket.send_json(
+                            {
+                                "type": "conversation.item.input_audio_transcription.completed",
+                                "event_id": _realtime_event_id(),
+                                "item_id": input_audio_item_id,
+                                "transcript": text,
+                                "language": info.language,
+                                "duration": info.duration,
+                                "segments": segments,
+                            }
+                        )
+                        await websocket.send_json(
+                            {
+                                "type": "response.output_item.added",
+                                "event_id": _realtime_event_id(),
+                                "response_id": response_id,
+                                "output_index": 0,
+                                "item": {
+                                    "id": output_item_id,
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "status": "in_progress",
+                                    "content": [{"type": "text", "text": ""}],
+                                },
+                            }
+                        )
+                        if text:
+                            await websocket.send_json(
+                                {
+                                    "type": "response.output_text.delta",
+                                    "event_id": _realtime_event_id(),
+                                    "response_id": response_id,
+                                    "item_id": output_item_id,
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "delta": text,
+                                }
+                            )
+                        await websocket.send_json(
+                            {
+                                "type": "response.output_text.done",
+                                "event_id": _realtime_event_id(),
+                                "response_id": response_id,
+                                "item_id": output_item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "text": text,
+                            }
+                        )
+                        await websocket.send_json(
+                            {
+                                "type": "response.output_item.done",
+                                "event_id": _realtime_event_id(),
+                                "response_id": response_id,
+                                "output_index": 0,
+                                "item": {
+                                    "id": output_item_id,
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "status": "completed",
+                                    "content": [{"type": "text", "text": text}],
+                                },
+                            }
+                        )
+                        await websocket.send_json(
+                            {
+                                "type": "response.done",
+                                "event_id": _realtime_event_id(),
+                                "response": {
+                                    "id": response_id,
+                                    "object": "realtime.response",
+                                    "status": "completed",
+                                    "output": [
+                                        {
+                                            "id": output_item_id,
+                                            "type": "message",
+                                            "role": "assistant",
+                                            "status": "completed",
+                                            "content": [{"type": "text", "text": text}],
+                                        }
+                                    ],
+                                },
+                            }
+                        )
+                    except HTTPException as exc:
+                        await websocket.send_json(
+                            {
+                                "type": "error",
+                                "event_id": _realtime_event_id(),
+                                "error": {"type": "server_error", "message": str(exc.detail)},
+                            }
+                        )
+                    except Exception as exc:
+                        await websocket.send_json(
+                            {
+                                "type": "error",
+                                "event_id": _realtime_event_id(),
+                                "error": {"type": "server_error", "message": str(exc)},
+                            }
+                        )
+                    finally:
+                        input_audio_buffer.clear()
+                        input_audio_item_id = None
+                    continue
+
                 text = _extract_text_from_response(message, session.input_text)
                 if not text:
                     await websocket.send_json(
