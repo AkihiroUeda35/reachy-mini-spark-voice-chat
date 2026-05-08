@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Qwen TTS-LLM-STT voice chat server and client on DGX spark"
 requires-python = ">=3.13"
 dependencies = [
+    "ddgs>=9.0.0",
     "gradio>=5.31.0",
     "opencv-python-headless>=4.10.0",
     "reachy-mini==1.7.1",

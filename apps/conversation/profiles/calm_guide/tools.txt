@@ -3,6 +3,7 @@ stop_dance
 play_emotion
 stop_emotion
 camera
+web_search
 idle_do_nothing
 head_tracking
 move_head

@@ -4,9 +4,12 @@ import asyncio
 import importlib
 import json
 import logging
+import os
 import random
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -36,12 +39,15 @@ DANCE_PACKAGE_SPEC = "reachy-mini-dances-library>=0.2.1"
 DANCE_IMPORT_NAME = "reachy_mini_dances_library.collection.dance"
 VISION_PACKAGE_SPEC = "opencv-python-headless>=4.10.0"
 VISION_IMPORT_NAME = "cv2"
+DDGS_PACKAGE_SPEC = "ddgs>=9.0.0"
+DDGS_IMPORT_NAME = "ddgs"
 GUI_TOOL_NAMES = [
     "dance",
     "stop_dance",
     "play_emotion",
     "stop_emotion",
     "camera",
+    "web_search",
     "idle_do_nothing",
     "head_tracking",
     "move_head",
@@ -89,6 +95,11 @@ class PlayEmotionArgs(BaseModel):
 
 class CameraArgs(BaseModel):
     question: str = Field(description="The question to ask about the latest camera frame.")
+
+
+class WebSearchArgs(BaseModel):
+    query: str = Field(description="Search query for recent information on the web.")
+    max_results: int = Field(default=5, ge=1, le=10, description="Maximum number of search results to return.")
 
 
 class HeadTrackingArgs(BaseModel):
@@ -144,6 +155,8 @@ class ReachyToolRuntime:
         self._dance_unavailable = False
         self._cv2: Any | None = None
         self._vision_unavailable = False
+        self._ddgs: Any | None = None
+        self._ddgs_unavailable = False
         self._head_tracking_task: asyncio.Task[None] | None = None
 
     def list_available_dances(self) -> list[str]:
@@ -229,6 +242,109 @@ class ReachyToolRuntime:
                 self._vision_unavailable = True
                 return None
         return self._cv2
+
+    def _load_ddgs(self) -> Any | None:
+        if self._ddgs_unavailable:
+            return None
+        if self._ddgs is not None:
+            return self._ddgs
+
+        try:
+            self._ddgs = importlib.import_module(DDGS_IMPORT_NAME)
+        except ImportError:
+            if not self._install_optional_package(DDGS_PACKAGE_SPEC, DDGS_IMPORT_NAME):
+                self._ddgs_unavailable = True
+                return None
+            try:
+                self._ddgs = importlib.import_module(DDGS_IMPORT_NAME)
+            except ImportError:
+                self._ddgs_unavailable = True
+                return None
+        return self._ddgs
+
+    def _tavily_api_key(self) -> str | None:
+        api_key = os.environ.get("TAVILY_API_KEY", "").strip()
+        return api_key or None
+
+    def _search_with_tavily(self, query: str, max_results: int) -> dict[str, Any]:
+        api_key = self._tavily_api_key()
+        if api_key is None:
+            raise RuntimeError("TAVILY_API_KEY is not set.")
+
+        payload = {
+            "api_key": api_key,
+            "query": query,
+            "search_depth": "basic",
+            "max_results": max_results,
+            "include_answer": True,
+            "include_images": False,
+            "include_raw_content": False,
+        }
+        request = urllib.request.Request(
+            "https://api.tavily.com/search",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.chat_timeout_s) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Tavily request failed with HTTP {exc.code}: {details}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Tavily request failed: {exc.reason}") from exc
+
+        raw_results = response_payload.get("results") or []
+        results: list[dict[str, Any]] = []
+        for item in raw_results[:max_results]:
+            results.append(
+                {
+                    "title": item.get("title") or item.get("url") or "Untitled",
+                    "url": item.get("url") or "",
+                    "snippet": item.get("content") or "",
+                    "score": item.get("score"),
+                }
+            )
+        return {
+            "status": "ok",
+            "backend": "tavily",
+            "query": query,
+            "answer": response_payload.get("answer") or "",
+            "results": results,
+        }
+
+    def _search_with_duckduckgo(self, query: str, max_results: int) -> dict[str, Any]:
+        ddgs_module = self._load_ddgs()
+        if ddgs_module is None:
+            raise RuntimeError("DuckDuckGo backend is not available. Install the ddgs package to enable web search.")
+
+        try:
+            with ddgs_module.DDGS() as ddgs:
+                raw_results = list(ddgs.text(query, max_results=max_results))
+        except Exception as exc:
+            raise RuntimeError(f"DuckDuckGo search failed: {exc}") from exc
+
+        results: list[dict[str, Any]] = []
+        for item in raw_results[:max_results]:
+            results.append(
+                {
+                    "title": item.get("title") or item.get("href") or "Untitled",
+                    "url": item.get("href") or "",
+                    "snippet": item.get("body") or "",
+                }
+            )
+        return {
+            "status": "ok",
+            "backend": "duckduckgo",
+            "query": query,
+            "results": results,
+        }
+
+    def _run_web_search(self, query: str, max_results: int) -> dict[str, Any]:
+        if self._tavily_api_key() is not None:
+            return self._search_with_tavily(query, max_results)
+        return self._search_with_duckduckgo(query, max_results)
 
     def _face_cascade(self) -> Any | None:
         cv2 = self._load_cv2()
@@ -419,6 +535,23 @@ class ReachyToolRuntime:
             "answer": answer,
         }
 
+    async def web_search(self, query: str, max_results: int) -> dict[str, Any]:
+        backend = "tavily" if self._tavily_api_key() is not None else "duckduckgo"
+        logger.info("Tool call: web_search backend=%s query=%s max_results=%d", backend, query, max_results)
+        try:
+            result = await asyncio.to_thread(self._run_web_search, query, max_results)
+        except Exception as exc:
+            logger.exception("Web search failed")
+            return {
+                "error": f"Web search failed: {type(exc).__name__}: {exc}",
+                "backend": backend,
+                "query": query,
+            }
+
+        if not result.get("results"):
+            result["message"] = "No relevant results were found."
+        return result
+
     async def head_tracking(self, start: bool) -> dict[str, Any]:
         self.head_tracking_enabled = start
         status = "started" if start else "stopped"
@@ -557,15 +690,6 @@ def _tool_result_description(prefix: str, values: list[str]) -> str:
 
 
 def build_langchain_tools(runtime: ReachyToolRuntime, enabled_tool_names: list[str]) -> list[BaseTool]:
-    dance_description = _tool_result_description(
-        "Play a named or random dance move once or repeatedly in the background.",
-        runtime.list_available_dances(),
-    )
-    emotion_description = _tool_result_description(
-        "Play a named or random pre-recorded emotion in the background.",
-        runtime.list_available_emotions(),
-    )
-
     async def stop_dance_wrapper(dummy: bool) -> dict[str, Any]:
         _ = dummy
         return await runtime.stop_dance()
@@ -574,6 +698,28 @@ def build_langchain_tools(runtime: ReachyToolRuntime, enabled_tool_names: list[s
         _ = dummy
         return await runtime.stop_emotion()
 
+    def build_dance_tool() -> BaseTool:
+        return StructuredTool.from_function(
+            coroutine=runtime.dance,
+            name="dance",
+            description=_tool_result_description(
+                "Play a named or random dance move once or repeatedly in the background.",
+                runtime.list_available_dances(),
+            ),
+            args_schema=DanceArgs,
+        )
+
+    def build_emotion_tool() -> BaseTool:
+        return StructuredTool.from_function(
+            coroutine=runtime.play_emotion,
+            name="play_emotion",
+            description=_tool_result_description(
+                "Play a named or random pre-recorded emotion in the background.",
+                runtime.list_available_emotions(),
+            ),
+            args_schema=PlayEmotionArgs,
+        )
+
     tool_factories: dict[str, Any] = {
         "move_head": lambda: StructuredTool.from_function(
             coroutine=runtime.move_head,
@@ -581,24 +727,14 @@ def build_langchain_tools(runtime: ReachyToolRuntime, enabled_tool_names: list[s
             description="Move your head in a given direction: left, right, up, down or front.",
             args_schema=MoveHeadArgs,
         ),
-        "dance": lambda: StructuredTool.from_function(
-            coroutine=runtime.dance,
-            name="dance",
-            description=dance_description,
-            args_schema=DanceArgs,
-        ),
+        "dance": build_dance_tool,
         "stop_dance": lambda: StructuredTool.from_function(
             coroutine=stop_dance_wrapper,
             name="stop_dance",
             description="Stop the current dance move.",
             args_schema=StopMoveArgs,
         ),
-        "play_emotion": lambda: StructuredTool.from_function(
-            coroutine=runtime.play_emotion,
-            name="play_emotion",
-            description=emotion_description,
-            args_schema=PlayEmotionArgs,
-        ),
+        "play_emotion": build_emotion_tool,
         "stop_emotion": lambda: StructuredTool.from_function(
             coroutine=stop_emotion_wrapper,
             name="stop_emotion",
@@ -610,6 +746,12 @@ def build_langchain_tools(runtime: ReachyToolRuntime, enabled_tool_names: list[s
             name="camera",
             description="Take a picture with the camera and answer a question about it.",
             args_schema=CameraArgs,
+        ),
+        "web_search": lambda: StructuredTool.from_function(
+            coroutine=runtime.web_search,
+            name="web_search",
+            description="Search the web for up-to-date information. Uses Tavily when TAVILY_API_KEY is set, otherwise DuckDuckGo.",
+            args_schema=WebSearchArgs,
         ),
         "head_tracking": lambda: StructuredTool.from_function(
             coroutine=runtime.head_tracking,

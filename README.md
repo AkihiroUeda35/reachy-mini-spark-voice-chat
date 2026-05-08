@@ -120,6 +120,8 @@ uv pip install -e .
 
 If you want local script defaults from a file, create a root `.env`. That file is loaded by script entry points such as `samples/*.py`; `lib` itself does not auto-load it.
 
+The Reachy conversation app under [apps/conversation/main.py](/home/aki/server/apps/conversation/main.py#L44) is one of those entry points, so putting `TAVILY_API_KEY=...` in the repository-root `.env` enables the `web_search` tool to use Tavily automatically. If `TAVILY_API_KEY` is unset, the tool falls back to DuckDuckGo.
+
 ```bash
 cp .env.example .env
 ```
