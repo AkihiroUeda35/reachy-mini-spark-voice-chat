@@ -21,26 +21,54 @@ import numpy as np
 import soundfile as sf
 from websockets import connect as ws_connect
 
-from lib.config import project_root, service_url
-from lib.openai_model_registry import resolve_model
+from config import project_root, service_url
+from openai_model_registry import resolve_model
 
-DATA_DIR = project_root() / os.environ.get("ASR_OUTPUT_DIR", "data")
-ASR_BASE_URL = service_url("stt", "http://localhost:8020/v1")
-ASR_API_KEY = os.environ.get("ASR_API_KEY", "local")
-ASR_MODEL = os.environ.get("ASR_MODEL")
-ASR_MODEL_FALLBACK = os.environ.get("ASR_MODEL_FALLBACK", "whisper-1")
-ASR_LANGUAGE = os.environ.get("ASR_LANGUAGE", "ja")
-ASR_TIMEOUT = float(os.environ.get("ASR_TIMEOUT", "600"))
-ASR_TRANSPORT = os.environ.get("ASR_TRANSPORT", "realtime")
-ASR_SAMPLE_RATE = int(os.environ.get("ASR_SAMPLE_RATE", "16000"))
-ASR_RECORD_SECONDS = float(os.environ.get("ASR_RECORD_SECONDS", "5"))
-ASR_REALTIME_CHUNK_MS = int(os.environ.get("ASR_REALTIME_CHUNK_MS", "250"))
-ASR_VAD_THRESHOLD = float(os.environ.get("ASR_VAD_THRESHOLD", "0.012"))
-ASR_VAD_FRAME_MS = int(os.environ.get("ASR_VAD_FRAME_MS", "30"))
-ASR_VAD_START_MS = int(os.environ.get("ASR_VAD_START_MS", "90"))
-ASR_VAD_END_MS = int(os.environ.get("ASR_VAD_END_MS", "900"))
-ASR_VAD_PREROLL_MS = int(os.environ.get("ASR_VAD_PREROLL_MS", "450"))
-ASR_VAD_MAX_SECONDS = float(os.environ.get("ASR_VAD_MAX_SECONDS", "20"))
+DATA_DIR = project_root() / "data"
+ASR_BASE_URL = ""
+ASR_API_KEY = ""
+ASR_MODEL: str | None = None
+ASR_MODEL_FALLBACK = ""
+ASR_LANGUAGE = ""
+ASR_TIMEOUT = 600.0
+ASR_TRANSPORT = "realtime"
+ASR_SAMPLE_RATE = 16000
+ASR_RECORD_SECONDS = 5.0
+ASR_REALTIME_CHUNK_MS = 250
+ASR_VAD_THRESHOLD = 0.012
+ASR_VAD_FRAME_MS = 30
+ASR_VAD_START_MS = 90
+ASR_VAD_END_MS = 900
+ASR_VAD_PREROLL_MS = 450
+ASR_VAD_MAX_SECONDS = 20.0
+
+
+def refresh_settings() -> None:
+    global DATA_DIR, ASR_BASE_URL, ASR_API_KEY, ASR_MODEL, ASR_MODEL_FALLBACK
+    global ASR_LANGUAGE, ASR_TIMEOUT, ASR_TRANSPORT, ASR_SAMPLE_RATE, ASR_RECORD_SECONDS
+    global ASR_REALTIME_CHUNK_MS, ASR_VAD_THRESHOLD, ASR_VAD_FRAME_MS
+    global ASR_VAD_START_MS, ASR_VAD_END_MS, ASR_VAD_PREROLL_MS, ASR_VAD_MAX_SECONDS
+
+    DATA_DIR = project_root() / os.environ.get("ASR_OUTPUT_DIR", "data")
+    ASR_BASE_URL = service_url("stt", "http://localhost:8020/v1")
+    ASR_API_KEY = os.environ.get("ASR_API_KEY", "local")
+    ASR_MODEL = os.environ.get("ASR_MODEL")
+    ASR_MODEL_FALLBACK = os.environ.get("ASR_MODEL_FALLBACK", "whisper-1")
+    ASR_LANGUAGE = os.environ.get("ASR_LANGUAGE", "ja")
+    ASR_TIMEOUT = float(os.environ.get("ASR_TIMEOUT", "600"))
+    ASR_TRANSPORT = os.environ.get("ASR_TRANSPORT", "realtime")
+    ASR_SAMPLE_RATE = int(os.environ.get("ASR_SAMPLE_RATE", "16000"))
+    ASR_RECORD_SECONDS = float(os.environ.get("ASR_RECORD_SECONDS", "5"))
+    ASR_REALTIME_CHUNK_MS = int(os.environ.get("ASR_REALTIME_CHUNK_MS", "250"))
+    ASR_VAD_THRESHOLD = float(os.environ.get("ASR_VAD_THRESHOLD", "0.012"))
+    ASR_VAD_FRAME_MS = int(os.environ.get("ASR_VAD_FRAME_MS", "30"))
+    ASR_VAD_START_MS = int(os.environ.get("ASR_VAD_START_MS", "90"))
+    ASR_VAD_END_MS = int(os.environ.get("ASR_VAD_END_MS", "900"))
+    ASR_VAD_PREROLL_MS = int(os.environ.get("ASR_VAD_PREROLL_MS", "450"))
+    ASR_VAD_MAX_SECONDS = float(os.environ.get("ASR_VAD_MAX_SECONDS", "20"))
+
+
+refresh_settings()
 
 
 @dataclass

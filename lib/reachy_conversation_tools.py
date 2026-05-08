@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import json
 import logging
 import os
@@ -28,7 +27,7 @@ from pydantic import SecretStr
 from langchain_openai import ChatOpenAI
 from reachy_mini_dances_library.dance_move import DanceMove
 
-from lib.jma_weather_tool import get_jma_weather_tool
+from jma_weather_tool import get_jma_weather_tool
 
 
 logger = logging.getLogger(__name__)
@@ -36,11 +35,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_EMOTION_DATASET = "pollen-robotics/reachy-mini-emotions-library"
 DANCE_PACKAGE_SPEC = "reachy-mini-dances-library>=0.2.1"
-DANCE_IMPORT_NAME = "reachy_mini_dances_library.collection.dance"
 VISION_PACKAGE_SPEC = "opencv-python-headless>=4.10.0"
-VISION_IMPORT_NAME = "cv2"
 DDGS_PACKAGE_SPEC = "ddgs>=9.0.0"
-DDGS_IMPORT_NAME = "ddgs"
 GUI_TOOL_NAMES = [
     "dance",
     "stop_dance",
@@ -200,7 +196,6 @@ class ReachyToolRuntime:
         if result.returncode != 0:
             logger.error("Optional dependency install failed: %s", result.stderr.strip() or result.stdout.strip())
             return False
-        importlib.invalidate_caches()
         return True
 
     def _load_dance_moves(self) -> dict[str, Any]:
@@ -210,13 +205,13 @@ class ReachyToolRuntime:
             return self._dance_moves
 
         try:
-            dance_module = importlib.import_module(DANCE_IMPORT_NAME)
+            from reachy_mini_dances_library.collection import dance as dance_module
         except ImportError:
-            if not self._install_optional_package(DANCE_PACKAGE_SPEC, DANCE_IMPORT_NAME):
+            if not self._install_optional_package(DANCE_PACKAGE_SPEC, "reachy_mini_dances_library.collection.dance"):
                 self._dance_unavailable = True
                 return {}
             try:
-                dance_module = importlib.import_module(DANCE_IMPORT_NAME)
+                from reachy_mini_dances_library.collection import dance as dance_module
             except ImportError:
                 self._dance_unavailable = True
                 return {}
@@ -231,13 +226,17 @@ class ReachyToolRuntime:
             return self._cv2
 
         try:
-            self._cv2 = importlib.import_module(VISION_IMPORT_NAME)
+            import cv2
+
+            self._cv2 = cv2
         except ImportError:
-            if not self._install_optional_package(VISION_PACKAGE_SPEC, VISION_IMPORT_NAME):
+            if not self._install_optional_package(VISION_PACKAGE_SPEC, "cv2"):
                 self._vision_unavailable = True
                 return None
             try:
-                self._cv2 = importlib.import_module(VISION_IMPORT_NAME)
+                import cv2
+
+                self._cv2 = cv2
             except ImportError:
                 self._vision_unavailable = True
                 return None
@@ -250,13 +249,17 @@ class ReachyToolRuntime:
             return self._ddgs
 
         try:
-            self._ddgs = importlib.import_module(DDGS_IMPORT_NAME)
+            import ddgs
+
+            self._ddgs = ddgs
         except ImportError:
-            if not self._install_optional_package(DDGS_PACKAGE_SPEC, DDGS_IMPORT_NAME):
+            if not self._install_optional_package(DDGS_PACKAGE_SPEC, "ddgs"):
                 self._ddgs_unavailable = True
                 return None
             try:
-                self._ddgs = importlib.import_module(DDGS_IMPORT_NAME)
+                import ddgs
+
+                self._ddgs = ddgs
             except ImportError:
                 self._ddgs_unavailable = True
                 return None

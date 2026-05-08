@@ -1,6 +1,6 @@
 # spark-voice-chat
 
-The scripts in this directory are entry points. Reusable code lives in [lib](../lib). If a script needs `.env`, the script itself loads it before importing the reusable modules.
+The scripts in this directory are entry points. Reusable code lives in [lib](../lib). Install the repository as an editable package first so these entry points can import the shared modules directly as top-level names such as `local_tts`, `whisper_asr`, and `config`.
 
 Small local sample that generates a short Japanese script with a Qwen model served by vLLM on `http://localhost:8010/v1`, then sends it to the local Qwen3-TTS wrapper on `http://localhost:8020/v1/audio/speech` and stores the resulting WAV in `./data/`.
 

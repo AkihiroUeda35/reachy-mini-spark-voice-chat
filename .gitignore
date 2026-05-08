@@ -9,4 +9,4 @@ __pycache__/
 .env
 */models/*
 */voices/*
-spark_voice_chat.egg-info/*
+**/spark_voice_chat.egg-info/*

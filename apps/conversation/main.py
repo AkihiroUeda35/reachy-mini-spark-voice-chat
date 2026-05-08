@@ -2,92 +2,36 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
-import importlib
-import json
 import logging
 import os
 import signal
-import subprocess
-import sys
 import threading
-import uuid
 import wave
 from collections import deque
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any, cast
-from urllib.parse import urlparse, urlunparse
+from typing import Any
 
 import httpx
-import gradio as gr
 import numpy as np
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import BaseTool
-from langchain_openai import ChatOpenAI
-from pipecat.frames.frames import EndFrame, ErrorFrame, FunctionCallInProgressFrame, FunctionCallResultFrame, LLMContextFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame, OutputAudioRawFrame
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pydantic import SecretStr
 from reachy_mini import ReachyMini
 from rich.logging import RichHandler
-from websockets import connect as ws_connect
 
+import local_tts
+import reachy_conversation_tools as reachy_tools
+import whisper_asr as asr_tools
+from config import load_entrypoint_env
+from openai_model_registry import resolve_model
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+from gradio_ui import launch_gradio_ui
+from pipeline import SynthesizedAudio, _resample_audio, run_pipeline
+from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_voice_by_name, save_profile_definition as _save_profile_definition
 
-importlib.import_module("lib.config").load_env()
+load_entrypoint_env(local_tts, asr_tools)
 
-asr_tools = importlib.import_module("lib.whisper_asr")
-local_tts = importlib.import_module("lib.local_tts")
-model_registry = importlib.import_module("lib.openai_model_registry")
-reachy_tools = importlib.import_module("lib.reachy_conversation_tools")
-
-build_langchain_tools = reachy_tools.build_langchain_tools
 GUI_TOOL_NAMES = reachy_tools.GUI_TOOL_NAMES
-ReachyToolRuntime = reachy_tools.ReachyToolRuntime
-resolve_model = model_registry.resolve_model
-
-
-APP_DIR = Path(__file__).resolve().parent
-DEFAULT_PROFILE_DIR = APP_DIR / "profiles" / "default"
-DEFAULT_DATA_DIR = ROOT_DIR / "data" / "conversation"
-COMMON_INSTRUCTIONS_FILE = APP_DIR / "profiles" / "common_instructions.txt"
-DEFAULT_CHARACTER_FILE = DEFAULT_PROFILE_DIR / "character.txt"
-DEFAULT_VOICE_FILE = DEFAULT_PROFILE_DIR / "voice.txt"
-DEFAULT_TOOLS_FILE = DEFAULT_PROFILE_DIR / "tools.txt"
-DEFAULT_VOICE = "Ono_Anna"
-
-VOICE_CHOICES: list[tuple[str, str]] = [
-    ("Vivian", "Bright, slightly edgy young female voice. [Chinese]"),
-    ("Serena", "Warm, gentle young female voice. [Chinese]"),
-    ("Uncle_Fu", "Seasoned male voice with a low, mellow timbre. [Chinese]"),
-    ("Dylan", "Youthful Beijing male voice with a clear, natural timbre. [Chinese - Beijing Dialect]"),
-    ("Eric", "Lively Chengdu male voice with a slightly husky brightness. [Chinese - Sichuan Dialect]"),
-    ("Ryan", "Dynamic male voice with strong rhythmic drive. [English]"),
-    ("Aiden", "Sunny American male voice with a clear midrange. [English]"),
-    ("Ono_Anna", "Playful Japanese female voice with a light, nimble timbre. [Japanese]"),
-    ("Sohee", "Warm Korean female voice with rich emotion. [Korean]"),
-]
-
-
-def _read_text_file(path: Path, fallback: str = "") -> str:
-    if path.is_file():
-        return path.read_text(encoding="utf-8").strip()
-    return fallback
-
-
-COMMON_SYSTEM_PROMPT = _read_text_file(COMMON_INSTRUCTIONS_FILE)
-DEFAULT_CHARACTER_PROMPT = _read_text_file(DEFAULT_CHARACTER_FILE)
-DEFAULT_SYSTEM_PROMPT = "\n\n".join(part for part in (COMMON_SYSTEM_PROMPT, DEFAULT_CHARACTER_PROMPT) if part).strip()
 
 CHAT_BASE_URL = local_tts.CHAT_BASE_URL
 CHAT_API_KEY = local_tts.CHAT_API_KEY
@@ -103,73 +47,26 @@ TTS_INSTRUCTIONS = local_tts.TTS_INSTRUCTIONS
 TTS_SAMPLE_RATE = local_tts.TTS_SAMPLE_RATE
 VOICE = local_tts.VOICE
 
-TTS_TIMEOUT = float(importlib.import_module("os").environ.get("TTS_TIMEOUT", "600"))
-TTS_STREAM_CHUNK_BYTES = int(importlib.import_module("os").environ.get("TTS_STREAM_CHUNK_BYTES", "8192"))
-TTS_TRANSPORT = importlib.import_module("os").environ.get("TTS_TRANSPORT", "realtime")
+TTS_TRANSPORT = os.environ.get("TTS_TRANSPORT", "realtime")
 SHUTDOWN_STEP_TIMEOUT_S = 2.0
 
 
-@dataclass
-class SynthesizedAudio:
-    pcm16_bytes: bytes
-    sample_rate: int
-    num_channels: int
+def active_tools_for_profile(profiles_dir: Path, profile: str) -> list[str]:
+    return _active_tools_for_profile(profiles_dir, profile, GUI_TOOL_NAMES)
 
 
-@dataclass
-class PipelineResult:
-    assistant_text: str
-    audio: SynthesizedAudio
+def save_profile_definition(
+    profiles_dir: Path,
+    profile: str,
+    character_prompt: str,
+    selected_tools: list[str],
+    voice: str,
+) -> Path:
+    return _save_profile_definition(profiles_dir, profile, character_prompt, selected_tools, voice, GUI_TOOL_NAMES)
 
 
-@dataclass
-class RuntimeSettings:
-    profiles_dir: Path
-    active_profile: str
-    enabled_tools: list[str]
-    active_character_prompt: str
-    active_instructions: str
-    active_voice: str
-
-    def __post_init__(self) -> None:
-        self._lock = threading.Lock()
-        self._version = 0
-
-    def snapshot(self) -> tuple[str, list[str], str, str, str, int]:
-        with self._lock:
-            return (
-                self.active_profile,
-                list(self.enabled_tools),
-                self.active_character_prompt,
-                self.active_instructions,
-                self.active_voice,
-                self._version,
-            )
-
-    def update(
-        self,
-        profile: str,
-        enabled_tools: list[str],
-        character_prompt: str,
-        instructions: str,
-        voice: str,
-    ) -> tuple[str, list[str], str, str, str, int]:
-        normalized = [tool for tool in GUI_TOOL_NAMES if tool in enabled_tools]
-        with self._lock:
-            self.active_profile = profile
-            self.enabled_tools = normalized
-            self.active_character_prompt = character_prompt.strip()
-            self.active_instructions = instructions.strip()
-            self.active_voice = voice
-            self._version += 1
-            return (
-                self.active_profile,
-                list(self.enabled_tools),
-                self.active_character_prompt,
-                self.active_instructions,
-                self.active_voice,
-                self._version,
-            )
+def load_profile_prompt(args: argparse.Namespace) -> str:
+    return _load_profile_prompt(args)
 
 
 def configure_logging(debug: bool) -> None:
@@ -239,191 +136,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_tools_file(profile_dir: Path) -> list[str]:
-    tools_file = profile_dir / "tools.txt"
-    if not tools_file.is_file():
-        tools_file = DEFAULT_TOOLS_FILE
-    names: list[str] = []
-    for raw_line in tools_file.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        names.append(line)
-    return names
-
-
-def list_profile_names(profiles_dir: Path) -> list[str]:
-    names: list[str] = []
-    for entry in sorted(profiles_dir.iterdir() if profiles_dir.is_dir() else []):
-        if entry.is_dir() and ((entry / "character.txt").is_file() or (entry / "instructions.txt").is_file()):
-            names.append(entry.name)
-    if "default" not in names and DEFAULT_PROFILE_DIR.is_dir():
-        names.append("default")
-    return sorted(set(names))
-
-
-def active_tools_for_profile(profiles_dir: Path, profile: str) -> list[str]:
-    return [tool for tool in parse_tools_file(profiles_dir / profile) if tool in GUI_TOOL_NAMES]
-
-
-def compose_system_prompt(character_prompt: str) -> str:
-    parts = [COMMON_SYSTEM_PROMPT.strip(), character_prompt.strip()]
-    return "\n\n".join(part for part in parts if part).strip()
-
-
-def normalize_profile_name(profile: str) -> str:
-    normalized = profile.strip().replace("/", "-").replace("\\", "-")
-    normalized = "_".join(normalized.split())
-    if normalized in {"", ".", ".."}:
-        return ""
-    return normalized
-
-
-def load_profile_character_prompt_by_name(profiles_dir: Path, profile: str, fallback: str) -> str:
-    profile_dir = profiles_dir / profile
-    character_file = profile_dir / "character.txt"
-    if character_file.is_file():
-        return character_file.read_text(encoding="utf-8").strip()
-    prompt_file = profiles_dir / profile / "instructions.txt"
-    if prompt_file.is_file():
-        return prompt_file.read_text(encoding="utf-8").strip()
-    return fallback
-
-
-def load_profile_prompt_by_name(profiles_dir: Path, profile: str, fallback: str) -> str:
-    character_prompt = load_profile_character_prompt_by_name(profiles_dir, profile, fallback)
-    return compose_system_prompt(character_prompt)
-
-
-def load_profile_voice_by_name(profiles_dir: Path, profile: str, fallback: str = DEFAULT_VOICE) -> str:
-    profile_dir = profiles_dir / profile
-    voice = _read_text_file(profile_dir / "voice.txt", fallback).strip()
-    if any(voice == name for name, _description in VOICE_CHOICES):
-        return voice
-    return fallback
-
-
-def save_profile_definition(
-    profiles_dir: Path,
-    profile: str,
-    character_prompt: str,
-    selected_tools: list[str],
-    voice: str,
-) -> Path:
-    profile_dir = profiles_dir / profile
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    (profile_dir / "character.txt").write_text(character_prompt.strip() + "\n", encoding="utf-8")
-    ordered_tools = [tool for tool in GUI_TOOL_NAMES if tool in selected_tools]
-    (profile_dir / "tools.txt").write_text("\n".join(ordered_tools) + "\n", encoding="utf-8")
-    (profile_dir / "voice.txt").write_text(voice.strip() + "\n", encoding="utf-8")
-    return profile_dir
-
-
-def load_profile_prompt(args: argparse.Namespace) -> str:
-    profiles_dir = Path(args.profiles_dir).expanduser().resolve()
-    return load_profile_prompt_by_name(profiles_dir, args.profile, DEFAULT_CHARACTER_PROMPT)
-
-
-def _content_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "".join(parts)
-    return str(content or "")
-
-
-def _to_langchain_messages(messages: list[Any]) -> list[Any]:
-    converted: list[Any] = []
-    for message in messages:
-        if isinstance(message, (HumanMessage, AIMessage, SystemMessage, ToolMessage)):
-            converted.append(message)
-            continue
-        if not isinstance(message, dict):
-            continue
-        role = str(message.get("role") or "")
-        content = message.get("content", "")
-        if role == "user":
-            converted.append(HumanMessage(content=_content_text(content)))
-        elif role == "assistant":
-            converted.append(AIMessage(content=_content_text(content)))
-        elif role == "system":
-            converted.append(SystemMessage(content=_content_text(content)))
-    return converted
-
-
-def _build_llm_context(history: list[dict[str, str]], transcript_text: str) -> LLMContext:
-    messages: list[dict[str, Any]] = [*history, {"role": "user", "content": transcript_text}]
-    return LLMContext(messages=cast(Any, messages))
-
-
-def _realtime_url(base_url: str) -> str:
-    parsed = urlparse(base_url)
-    scheme = "wss" if parsed.scheme == "https" else "ws"
-    path = parsed.path.rstrip("/") + "/realtime"
-    return urlunparse((scheme, parsed.netloc, path, "", "", ""))
-
-
-async def _wait_for_event(websocket, event_types: set[str]) -> dict[str, Any]:
-    while True:
-        payload = json.loads(await websocket.recv())
-        if payload.get("type") == "error":
-            detail = payload.get("error") or {}
-            raise RuntimeError(detail.get("message") or "Realtime TTS error")
-        if payload.get("type") in event_types:
-            return payload
-
-
-def _drain_ready_segments(buffer: str, *, final: bool) -> tuple[list[str], str]:
-    segments: list[str] = []
-    start = 0
-    for index, char in enumerate(buffer):
-        if char in "。！？!?\n":
-            segment = buffer[start : index + 1].strip()
-            if segment:
-                segments.append(segment)
-            start = index + 1
-
-    remainder = buffer[start:]
-    if final:
-        tail = remainder.strip()
-        if tail:
-            segments.append(tail)
-        remainder = ""
-    return segments, remainder
-
-
-def _pcm16_to_float32(audio_bytes: bytes, num_channels: int) -> np.ndarray:
-    audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    if num_channels > 1:
-        return audio.reshape(-1, num_channels)
-    return audio
-
-
-def _resample_audio(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
-    if source_rate == target_rate:
-        return audio.astype(np.float32, copy=False)
-
-    if audio.ndim == 1:
-        target_length = max(1, int(round(audio.shape[0] * target_rate / source_rate)))
-        source_positions = np.linspace(0.0, 1.0, num=audio.shape[0], endpoint=False)
-        target_positions = np.linspace(0.0, 1.0, num=target_length, endpoint=False)
-        return np.interp(target_positions, source_positions, audio).astype(np.float32)
-
-    channels = [
-        _resample_audio(audio[:, channel_index], source_rate, target_rate)
-        for channel_index in range(audio.shape[1])
-    ]
-    return np.stack(channels, axis=1).astype(np.float32)
-
-
 def _mono_audio(audio: np.ndarray) -> np.ndarray:
     normalized = np.asarray(audio, dtype=np.float32)
     if normalized.ndim == 2 and normalized.shape[1] > normalized.shape[0]:
@@ -443,437 +155,6 @@ def _prepared_audio_from_pcm16(audio_bytes: bytes, *, sample_rate: int, stem: st
         upload_bytes=asr_tools._wav_bytes(audio_bytes, sample_rate),
         pcm16_bytes=audio_bytes,
         sample_rate=sample_rate,
-    )
-
-
-class RichTraceProcessor(FrameProcessor):
-    def __init__(self):
-        super().__init__(name="RichTraceProcessor")
-        self._logger = logging.getLogger("conversation.trace")
-
-    async def process_frame(self, frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, LLMFullResponseStartFrame):
-            self._logger.info("[bold cyan]LLM[/] response started")
-        elif isinstance(frame, FunctionCallInProgressFrame):
-            self._logger.info(
-                "[bold magenta]LLM tool[/] %s %s",
-                frame.function_name,
-                _json_preview(frame.arguments),
-            )
-        elif isinstance(frame, FunctionCallResultFrame):
-            self._logger.info(
-                "[bold magenta]Tool result[/] %s %s",
-                frame.function_name,
-                _json_preview(frame.result),
-            )
-        elif isinstance(frame, ErrorFrame):
-            self._logger.error("[bold red]Pipeline error[/] %s", frame.error)
-        elif isinstance(frame, LLMFullResponseEndFrame):
-            self._logger.info("[bold cyan]LLM[/] response finished")
-        await self.push_frame(frame, direction)
-
-
-def _json_preview(payload: Any, max_len: int = 240) -> str:
-    raw = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
-    if len(raw) <= max_len:
-        return raw
-    return raw[: max_len - 3] + "..."
-
-
-TOOL_CHECK_SENTINEL = "No"
-
-
-class ReachyLangChainProcessor(FrameProcessor):
-    def __init__(self, args: argparse.Namespace, tools: list[BaseTool]):
-        super().__init__(name="ReachyLangChainProcessor")
-        self._logger = logging.getLogger("conversation.llm")
-        self._tools_by_name = {tool.name: tool for tool in tools}
-        self._model = ChatOpenAI(
-            model=args.chat_model,
-            base_url=args.chat_base_url,
-            api_key=SecretStr(args.chat_api_key),
-            temperature=args.llm_temperature,
-            max_completion_tokens=args.max_completion_tokens,
-            use_responses_api=False,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        ).bind_tools(tools)
-        self._system_prompt = args.system_prompt
-        self._max_tool_rounds = args.max_tool_rounds
-
-    async def _follow_up_for_tool_use(self, messages: list[Any]):
-        return await self._model.ainvoke(
-            [
-                *messages,
-                HumanMessage(
-                    content=(
-                        "Call a tool now only if one is still needed to continue this reply. "
-                        f"If no tool call is needed, reply with exactly {TOOL_CHECK_SENTINEL}."
-                    )
-                ),
-            ]
-        )
-
-    async def process_frame(self, frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-
-        if not isinstance(frame, LLMContextFrame):
-            await self.push_frame(frame, direction)
-            return
-
-        messages = [SystemMessage(content=self._system_prompt), *_to_langchain_messages(frame.context.messages)]
-        await self.push_frame(LLMFullResponseStartFrame(), direction)
-
-        try:
-            for round_index in range(self._max_tool_rounds):
-                self._logger.info("[bold cyan]LLM[/] round %d", round_index + 1)
-                response = await self._model.ainvoke(messages)
-                text = _content_text(response.content).strip()
-                tool_calls = getattr(response, "tool_calls", None) or []
-                messages.append(response)
-
-                if not tool_calls and text and self._tools_by_name:
-                    self._logger.info("[bold cyan]LLM[/] tool follow-up check")
-                    follow_up = await self._follow_up_for_tool_use(messages)
-                    follow_up_tool_calls = getattr(follow_up, "tool_calls", None) or []
-                    if follow_up_tool_calls:
-                        response = follow_up
-                        tool_calls = follow_up_tool_calls
-                        messages.append(follow_up)
-                    else:
-                        self._logger.debug("Tool follow-up check ended without a tool call")
-
-                if not tool_calls:
-                    if text:
-                        await self.push_frame(LLMTextFrame(text=text), direction)
-                    break
-
-                group_id = uuid.uuid4().hex
-                for tool_call in tool_calls:
-                    tool_name = str(tool_call.get("name") or "")
-                    tool_args = tool_call.get("args") or {}
-                    tool_call_id = str(tool_call.get("id") or uuid.uuid4().hex)
-                    tool = self._tools_by_name.get(tool_name)
-                    if tool is None:
-                        result = {"error": f"unknown tool: {tool_name}"}
-                    else:
-                        await self.push_frame(
-                            FunctionCallInProgressFrame(
-                                function_name=tool_name,
-                                tool_call_id=tool_call_id,
-                                arguments=tool_args,
-                                group_id=group_id,
-                            ),
-                            direction,
-                        )
-                        try:
-                            result = await tool.ainvoke(tool_args)
-                        except Exception as exc:
-                            result = {"error": f"{type(exc).__name__}: {exc}"}
-                    await self.push_frame(
-                        FunctionCallResultFrame(
-                            function_name=tool_name,
-                            tool_call_id=tool_call_id,
-                            arguments=tool_args,
-                            result=result,
-                        ),
-                        direction,
-                    )
-                    messages.append(ToolMessage(content=_json_preview(result, max_len=4000), tool_call_id=tool_call_id))
-            else:
-                raise RuntimeError("LLM exceeded the maximum tool-call rounds.")
-        except Exception as exc:
-            await self.push_frame(ErrorFrame(error=f"LangChain agent failed: {exc}"), direction)
-        finally:
-            await self.push_frame(LLMFullResponseEndFrame(), direction)
-
-
-class ReachyTTSProcessor(FrameProcessor):
-    def __init__(self, args: argparse.Namespace):
-        super().__init__(name="ReachyTTSProcessor")
-        self._args = args
-        self._logger = logging.getLogger("conversation.tts")
-        self._pending_text = ""
-        self._segment_queue: asyncio.Queue[str | None] | None = None
-        self._worker_task: asyncio.Task[None] | None = None
-
-    async def _stop_worker(self) -> None:
-        if self._segment_queue is not None:
-            await self._segment_queue.put(None)
-        if self._worker_task is not None:
-            with suppress(asyncio.CancelledError):
-                await self._worker_task
-        self._worker_task = None
-        self._segment_queue = None
-
-    async def _tts_worker(self, direction: FrameDirection) -> None:
-        if self._segment_queue is None:
-            return
-        try:
-            if self._args.tts_transport == "realtime":
-                async with ReachyRealtimeTTSSession(self._args) as websocket:
-                    while True:
-                        segment = await self._segment_queue.get()
-                        try:
-                            if segment is None:
-                                return
-                            self._logger.info("[bold green]TTS[/] synthesizing segment %s", segment)
-                            async for audio_frame in synthesize_realtime_audio_stream(self._args, websocket, segment):
-                                await self.push_frame(audio_frame, direction)
-                        finally:
-                            self._segment_queue.task_done()
-            else:
-                while True:
-                    segment = await self._segment_queue.get()
-                    try:
-                        if segment is None:
-                            return
-                        self._logger.info("[bold green]TTS[/] synthesizing segment %s", segment)
-                        async for audio_frame in synthesize_audio_stream(self._args, segment):
-                            await self.push_frame(audio_frame, direction)
-                    finally:
-                        self._segment_queue.task_done()
-        except Exception as exc:
-            await self.push_frame(ErrorFrame(error=f"Streaming TTS failed: {exc}"), direction)
-
-    async def process_frame(self, frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-
-        if isinstance(frame, LLMFullResponseStartFrame):
-            self._logger.info("[bold green]TTS[/] response stream started")
-            self._pending_text = ""
-            self._segment_queue = asyncio.Queue()
-            self._worker_task = asyncio.create_task(self._tts_worker(direction))
-            await self.push_frame(frame, direction)
-            return
-
-        if isinstance(frame, LLMTextFrame):
-            if frame.text:
-                self._pending_text += frame.text
-                segments, remainder = _drain_ready_segments(self._pending_text, final=False)
-                self._pending_text = remainder
-                if self._segment_queue is not None:
-                    for segment in segments:
-                        await self._segment_queue.put(segment)
-            await self.push_frame(frame, direction)
-            return
-
-        if isinstance(frame, LLMFullResponseEndFrame):
-            if self._segment_queue is not None:
-                segments, remainder = _drain_ready_segments(self._pending_text, final=True)
-                self._pending_text = remainder
-                for segment in segments:
-                    await self._segment_queue.put(segment)
-                await self._segment_queue.join()
-                await self._stop_worker()
-            self._logger.info("[bold green]TTS[/] response stream finished")
-            await self.push_frame(frame, direction)
-            return
-
-        await self.push_frame(frame, direction)
-
-
-class ReachyRealtimeTTSSession:
-    def __init__(self, args: argparse.Namespace):
-        self._args = args
-        self._websocket = None
-
-    async def __aenter__(self):
-        self._websocket = await ws_connect(_realtime_url(self._args.tts_base_url), max_size=None)
-        payload = json.loads(await self._websocket.recv())
-        if payload.get("type") != "session.created":
-            raise RuntimeError(f"Unexpected realtime event: {payload}")
-        await self._websocket.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "model": self._args.tts_model,
-                        "voice": self._args.voice,
-                        "instructions": self._args.tts_instructions,
-                        "task_type": self._args.tts_task_type,
-                        "language": self._args.tts_language,
-                    },
-                }
-            )
-        )
-        await _wait_for_event(self._websocket, {"session.updated"})
-        return self._websocket
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if self._websocket is not None:
-            await self._websocket.close()
-            self._websocket = None
-
-
-class ReachyAudioPlayer(FrameProcessor):
-    def __init__(self, robot: ReachyMini):
-        super().__init__(name="ReachyAudioPlayer")
-        self._robot = robot
-        self._logger = logging.getLogger("conversation.audio")
-        self._started = False
-
-    async def process_frame(self, frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, OutputAudioRawFrame):
-            waveform = _pcm16_to_float32(frame.audio, frame.num_channels)
-            output_rate = self._robot.media.get_output_audio_samplerate()
-            if frame.sample_rate != output_rate:
-                waveform = _resample_audio(waveform, frame.sample_rate, output_rate)
-            if not self._started:
-                self._logger.info("[bold yellow]Audio[/] streaming assistant reply to Reachy speaker")
-                self._started = True
-            await asyncio.to_thread(self._robot.media.push_audio_sample, waveform)
-        elif isinstance(frame, EndFrame):
-            self._started = False
-        await self.push_frame(frame, direction)
-
-
-class ResultCollector(FrameProcessor):
-    def __init__(self):
-        super().__init__(name="ResultCollector")
-        self.assistant_chunks: list[str] = []
-        self.audio_chunks: list[bytes] = []
-        self.sample_rate: int | None = None
-        self.num_channels: int | None = None
-        self.errors: list[str] = []
-
-    async def process_frame(self, frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, LLMTextFrame) and frame.text:
-            self.assistant_chunks.append(frame.text)
-        elif isinstance(frame, OutputAudioRawFrame):
-            if self.sample_rate is None:
-                self.sample_rate = frame.sample_rate
-                self.num_channels = frame.num_channels
-            if self.sample_rate == frame.sample_rate and self.num_channels == frame.num_channels:
-                self.audio_chunks.append(frame.audio)
-        elif isinstance(frame, ErrorFrame):
-            self.errors.append(frame.error)
-        await self.push_frame(frame, direction)
-
-
-class PipelineTerminator(FrameProcessor):
-    def __init__(self):
-        super().__init__(name="PipelineTerminator")
-        self._task: PipelineTask | None = None
-        self._tool_calls_in_progress = 0
-        self._end_queued = False
-
-    def bind_task(self, task: PipelineTask) -> None:
-        self._task = task
-
-    async def process_frame(self, frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, FunctionCallInProgressFrame):
-            self._tool_calls_in_progress += 1
-        elif isinstance(frame, FunctionCallResultFrame):
-            self._tool_calls_in_progress = max(0, self._tool_calls_in_progress - 1)
-        elif isinstance(frame, LLMFullResponseEndFrame):
-            if not self._end_queued and self._tool_calls_in_progress == 0 and self._task is not None:
-                self._end_queued = True
-                await self._task.queue_frame(EndFrame())
-        await self.push_frame(frame, direction)
-
-
-async def synthesize_audio_stream(args: argparse.Namespace, text: str):
-    payload = {
-        "model": args.tts_model,
-        "task_type": args.tts_task_type,
-        "language": args.tts_language,
-        "voice": args.voice,
-        "input": text,
-        "instructions": args.tts_instructions,
-        "response_format": "pcm",
-        "stream": True,
-    }
-    async with httpx.AsyncClient(timeout=TTS_TIMEOUT) as client:
-        async with client.stream(
-            "POST",
-            f"{args.tts_base_url.rstrip('/')}/audio/speech",
-            headers={"Authorization": f"Bearer {args.tts_api_key}"},
-            json=payload,
-        ) as response:
-            response.raise_for_status()
-            async for chunk in response.aiter_bytes(chunk_size=TTS_STREAM_CHUNK_BYTES):
-                if chunk:
-                    yield OutputAudioRawFrame(audio=chunk, sample_rate=args.tts_sample_rate, num_channels=1)
-
-
-async def synthesize_realtime_audio_stream(args: argparse.Namespace, websocket, text: str):
-    await websocket.send(
-        json.dumps(
-            {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": text}],
-                },
-            }
-        )
-    )
-    await _wait_for_event(websocket, {"conversation.item.created"})
-    await websocket.send(json.dumps({"type": "response.create"}))
-    while True:
-        payload = json.loads(await websocket.recv())
-        msg_type = payload.get("type")
-        if msg_type == "error":
-            detail = payload.get("error") or {}
-            raise RuntimeError(detail.get("message") or "Realtime TTS error")
-        if msg_type == "response.audio.delta":
-            delta = payload.get("delta") or ""
-            if delta:
-                yield OutputAudioRawFrame(audio=base64.b64decode(delta), sample_rate=args.tts_sample_rate, num_channels=1)
-            continue
-        if msg_type == "response.done":
-            return
-
-
-def _create_turn_pipeline_runner() -> PipelineRunner:
-    return PipelineRunner(handle_sigint=False, handle_sigterm=False)
-
-
-async def run_pipeline(
-    args: argparse.Namespace,
-    runtime: ReachyToolRuntime,
-    transcript_text: str,
-    history: list[dict[str, str]],
-    enabled_tool_names: list[str],
-) -> PipelineResult:
-    tools = build_langchain_tools(runtime, enabled_tool_names)
-    llm = ReachyLangChainProcessor(args, tools)
-    trace = RichTraceProcessor()
-    tts = ReachyTTSProcessor(args)
-    collector = ResultCollector()
-    audio_player = ReachyAudioPlayer(runtime.robot)
-    terminator = PipelineTerminator()
-    pipeline = Pipeline([llm, trace, tts, collector, audio_player, terminator])
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(audio_in_sample_rate=args.sample_rate, audio_out_sample_rate=args.tts_sample_rate),
-        idle_timeout_secs=60,
-    )
-    terminator.bind_task(task)
-    runner = _create_turn_pipeline_runner()
-    runner_task = asyncio.create_task(runner.run(task))
-    await task.queue_frame(LLMContextFrame(_build_llm_context(history, transcript_text)))
-    await runner_task
-
-    if collector.errors:
-        raise RuntimeError("; ".join(collector.errors))
-    assistant_text = "".join(collector.assistant_chunks).strip()
-    if not assistant_text:
-        raise RuntimeError("LLM returned an empty response.")
-    if not collector.audio_chunks or collector.sample_rate is None or collector.num_channels is None:
-        raise RuntimeError("TTS returned no audio.")
-    return PipelineResult(
-        assistant_text=assistant_text,
-        audio=SynthesizedAudio(
-            pcm16_bytes=b"".join(collector.audio_chunks),
-            sample_rate=collector.sample_rate,
-            num_channels=collector.num_channels,
-        ),
     )
 
 
@@ -1009,51 +290,6 @@ def save_reply_audio(data_dir: Path, audio: SynthesizedAudio) -> Path:
     return output_path
 
 
-def _subprocess_stdout(command: list[str]) -> str:
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
-    if result.returncode not in {0, 1}:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"command failed: {' '.join(command)}")
-    return result.stdout.strip()
-
-
-def _list_listening_pids(port: int) -> list[int]:
-    output = _subprocess_stdout(["lsof", "-ti", f"tcp:{port}"])
-    pids: list[int] = []
-    for line in output.splitlines():
-        line = line.strip()
-        if line.isdigit():
-            pids.append(int(line))
-    return sorted(set(pids))
-
-
-def _read_process_command(pid: int) -> str:
-    return _subprocess_stdout(["ps", "-o", "command=", "-p", str(pid)])
-
-
-def _is_same_conversation_app_process(pid: int, app_path: Path) -> bool:
-    if pid == os.getpid():
-        return False
-    command = _read_process_command(pid)
-    app_markers = {
-        str(app_path),
-        str(app_path.relative_to(ROOT_DIR)),
-        "apps/conversation/main.py",
-    }
-    if not any(marker in command for marker in app_markers):
-        return False
-    return "uv" in command or ".venv/bin/python" in command
-
-
-def _free_gradio_port_if_same_uv_app(port: int, app_path: Path) -> list[int]:
-    killed_pids: list[int] = []
-    for pid in _list_listening_pids(port):
-        with suppress(Exception):
-            if _is_same_conversation_app_process(pid, app_path):
-                os.kill(pid, signal.SIGKILL)
-                killed_pids.append(pid)
-    return killed_pids
-
-
 async def _run_blocking_cleanup_step(logger: logging.Logger, name: str, func: Any, timeout_s: float = SHUTDOWN_STEP_TIMEOUT_S) -> None:
     error: list[BaseException] = []
     finished = threading.Event()
@@ -1105,6 +341,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
         active_character_prompt=load_profile_character_prompt_by_name(profiles_dir, args.profile, DEFAULT_CHARACTER_PROMPT),
         active_instructions=load_profile_prompt_by_name(profiles_dir, args.profile, DEFAULT_CHARACTER_PROMPT),
         active_voice=load_profile_voice_by_name(profiles_dir, args.profile, args.voice or DEFAULT_VOICE),
+        gui_tool_names=GUI_TOOL_NAMES,
     )
 
     robot_kwargs: dict[str, Any] = {}
@@ -1141,7 +378,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
     robot = ReachyMini(**robot_kwargs)
     robot.enable_motors()
     robot.wake_up()
-    runtime = ReachyToolRuntime(
+    runtime = reachy_tools.ReachyToolRuntime(
         robot,
         data_dir=data_dir,
         motion_duration_s=args.motion_duration,
@@ -1218,154 +455,6 @@ async def conversation_loop(args: argparse.Namespace) -> int:
         await _run_blocking_cleanup_step(app_logger, "media_manager.close", robot.media_manager.close)
         await _run_blocking_cleanup_step(app_logger, "client.disconnect", robot.client.disconnect)
     return 0
-
-
-def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings) -> gr.Blocks:
-    profiles_dir = runtime_settings.profiles_dir
-    profile_names = list_profile_names(profiles_dir)
-    initial_profile, initial_tools, initial_character_prompt, _initial_prompt, initial_voice, _initial_version = runtime_settings.snapshot()
-    voice_dropdown_choices = [(f"{name} - {description}", name) for name, description in VOICE_CHOICES]
-
-    def on_profile_change(profile: str) -> tuple[str, list[str], str, str]:
-        selected_profile = profile if profile in profile_names else initial_profile
-        selected_tools = active_tools_for_profile(profiles_dir, selected_profile)
-        character_prompt = load_profile_character_prompt_by_name(profiles_dir, selected_profile, DEFAULT_CHARACTER_PROMPT)
-        voice = load_profile_voice_by_name(profiles_dir, selected_profile, DEFAULT_VOICE)
-        status = f"Loaded character '{selected_profile}'. You can edit the character prompt, voice, save, or apply live."
-        return character_prompt, selected_tools, voice, status
-
-    def on_apply(profile: str, character_prompt: str, selected_tools: list[str], voice: str) -> str:
-        if profile not in profile_names:
-            return f"Unknown character '{profile}'."
-        active_profile, enabled_tools, _character_prompt, _instructions, active_voice, _version = runtime_settings.update(
-            profile,
-            selected_tools,
-            character_prompt,
-            compose_system_prompt(character_prompt),
-            voice,
-        )
-        return (
-            f"Live runtime updated: character={active_profile}, voice={active_voice}, "
-            f"tools={', '.join(enabled_tools) if enabled_tools else 'none'}"
-        )
-
-    def on_save(profile: str, character_prompt: str, selected_tools: list[str], voice: str) -> str:
-        if profile not in profile_names:
-            return f"Unknown character '{profile}'. Create it first."
-        profile_dir = save_profile_definition(profiles_dir, profile, character_prompt, selected_tools, voice)
-        runtime_settings.update(profile, selected_tools, character_prompt, compose_system_prompt(character_prompt), voice)
-        return f"Saved character '{profile}' to {profile_dir}."
-
-    def on_create(profile_name: str, character_prompt: str, selected_tools: list[str], voice: str):
-        nonlocal profile_names
-        normalized_name = normalize_profile_name(profile_name)
-        if not normalized_name:
-            return (
-                gr.update(),
-                character_prompt,
-                selected_tools,
-                voice,
-                "Enter a valid character name.",
-                profile_name,
-            )
-
-        profile_dir = save_profile_definition(
-            profiles_dir,
-            normalized_name,
-            character_prompt or DEFAULT_CHARACTER_PROMPT,
-            selected_tools or active_tools_for_profile(profiles_dir, initial_profile),
-            voice or DEFAULT_VOICE,
-        )
-        profile_names = sorted(set([*profile_names, normalized_name]))
-        saved_character_prompt = load_profile_character_prompt_by_name(profiles_dir, normalized_name, DEFAULT_CHARACTER_PROMPT)
-        saved_tools = active_tools_for_profile(profiles_dir, normalized_name)
-        saved_voice = load_profile_voice_by_name(profiles_dir, normalized_name, DEFAULT_VOICE)
-        runtime_settings.update(
-            normalized_name,
-            saved_tools,
-            saved_character_prompt,
-            compose_system_prompt(saved_character_prompt),
-            saved_voice,
-        )
-        return (
-            gr.update(choices=profile_names, value=normalized_name),
-            saved_character_prompt,
-            saved_tools,
-            saved_voice,
-            f"Created character '{normalized_name}' at {profile_dir}.",
-            "",
-        )
-
-    with gr.Blocks(title="Reachy Mini Conversation Settings") as demo:
-        gr.Markdown(
-            "# Reachy Mini Conversation\n"
-            "Use this panel to switch character, edit only the character-specific prompt, choose a voice, and save while the local conversation loop is running."
-        )
-        with gr.Row():
-            profile_dropdown = gr.Dropdown(label="Character", choices=profile_names, value=initial_profile)
-            new_profile_box = gr.Textbox(label="New Character Name", placeholder="new_character", interactive=True)
-            create_button = gr.Button("Create Character")
-        character_box = gr.Textbox(label="Character Prompt", value=initial_character_prompt, lines=12, interactive=True)
-        voice_dropdown = gr.Dropdown(label="Voice", choices=voice_dropdown_choices, value=initial_voice)
-        tool_checkboxes = gr.CheckboxGroup(label="Enabled Tools", choices=GUI_TOOL_NAMES, value=initial_tools)
-        status_box = gr.Textbox(label="Status", value="Ready.", interactive=False)
-        with gr.Row():
-            apply_button = gr.Button("Apply Live", variant="primary")
-            save_button = gr.Button("Save Character")
-
-        profile_dropdown.change(
-            on_profile_change,
-            inputs=[profile_dropdown],
-            outputs=[character_box, tool_checkboxes, voice_dropdown, status_box],
-        )
-        apply_button.click(
-            on_apply,
-            inputs=[profile_dropdown, character_box, tool_checkboxes, voice_dropdown],
-            outputs=[status_box],
-        )
-        save_button.click(
-            on_save,
-            inputs=[profile_dropdown, character_box, tool_checkboxes, voice_dropdown],
-            outputs=[status_box],
-        )
-        create_button.click(
-            on_create,
-            inputs=[new_profile_box, character_box, tool_checkboxes, voice_dropdown],
-            outputs=[profile_dropdown, character_box, tool_checkboxes, voice_dropdown, status_box, new_profile_box],
-        )
-
-    return demo
-
-
-def launch_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings):
-    demo = build_gradio_ui(args, runtime_settings)
-    app_path = APP_DIR / "main.py"
-    killed_pids = _free_gradio_port_if_same_uv_app(args.gradio_port, app_path)
-    if killed_pids:
-        logging.getLogger("conversation.app").warning(
-            "Killed existing conversation app process(es) on port %d: %s",
-            args.gradio_port,
-            ", ".join(str(pid) for pid in killed_pids),
-        )
-    logging.getLogger("conversation.app").info(
-        "[bold]Starting Gradio GUI[/] http://%s:%d",
-        args.gradio_host,
-        args.gradio_port,
-    )
-    try:
-        demo.launch(
-            server_name=args.gradio_host,
-            server_port=args.gradio_port,
-            prevent_thread_lock=True,
-            quiet=not args.debug,
-            show_error=True,
-            inbrowser=False,
-        )
-    except Exception:
-        with suppress(Exception):
-            demo.close()
-        raise
-    return demo
 
 
 def main() -> int:

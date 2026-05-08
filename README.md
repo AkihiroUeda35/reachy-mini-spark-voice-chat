@@ -104,9 +104,9 @@ curl http://localhost:8020/health
 
 ## Local Sample
 
-The sample script in [samples/langchain_openai_tts.py](samples/langchain_openai_tts.py) generates a short Japanese script with the local LLM, sends it to the local TTS wrapper, and writes a WAV file. Shared client code lives in [lib](lib), so future apps can reuse the same STT/LLM/TTS access layer directly.
+The sample script in [samples/langchain_openai_tts.py](samples/langchain_openai_tts.py) generates a short Japanese script with the local LLM, sends it to the local TTS wrapper, and writes a WAV file. Shared client code lives in [lib](lib), and app entry points live under [apps](apps).
 
-Install the local environment first. `uv sync` now installs this repository as an editable package, so `lib` can be imported without extra path hacks.
+Install the local environment first. `uv sync` installs this repository as an editable package, which is now the expected local-development setup. That editable install exposes the modules under [lib](lib) as top-level imports such as `import local_tts` and `import whisper_asr`, without wrapper files or repo-local path hacks.
 
 ```bash
 uv sync
@@ -118,7 +118,9 @@ If you already have the environment and only want to refresh the editable instal
 uv pip install -e .
 ```
 
-If you want local script defaults from a file, create a root `.env`. That file is loaded by script entry points such as `samples/*.py`; `lib` itself does not auto-load it.
+If you want local script defaults from a file, create a root `.env`. Entry points load that file during startup; reusable modules under [lib](lib) still do not auto-load `.env` by themselves.
+
+Application code under [apps](apps) is not installed as part of the editable package. Those entry points are intended to run from the repository tree, for example with `uv run python apps/conversation/main.py`, and they use same-directory imports inside `apps/conversation`.
 
 The Reachy conversation app under [apps/conversation/main.py](/home/aki/server/apps/conversation/main.py#L44) is one of those entry points, so putting `TAVILY_API_KEY=...` in the repository-root `.env` enables the `web_search` tool to use Tavily automatically. If `TAVILY_API_KEY` is unset, the tool falls back to DuckDuckGo.
 

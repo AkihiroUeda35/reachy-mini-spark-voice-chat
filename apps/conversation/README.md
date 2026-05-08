@@ -23,6 +23,15 @@ The orchestration path is:
 
 ## Run
 
+Install the repo as an editable package first so the shared STT/LLM/TTS modules are available as top-level imports.
+
+```bash
+uv sync
+# or: uv pip install -e .
+```
+
+The conversation app itself is still a repository-local entry point. It is run directly from [apps/conversation](apps/conversation), not from the installed package.
+
 ```bash
 uv run python apps/conversation/main.py
 uv run python apps/conversation/main.py --no-gradio

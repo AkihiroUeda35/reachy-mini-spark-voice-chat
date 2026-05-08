@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lib.reachy_conversation_tools import ReachyToolRuntime, build_langchain_tools
+from reachy_conversation_tools import ReachyToolRuntime, build_langchain_tools
 
 
 class _FakeRobot:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 
 _ENV_LOADED = False
@@ -53,6 +54,23 @@ def load_env(env_path: str | os.PathLike[str] | None = None, *, override: bool =
 
     _ENV_LOADED = True
     return candidate
+
+
+def refresh_module_settings(*modules: Any) -> None:
+    for module in modules:
+        refresh = getattr(module, "refresh_settings", None)
+        if callable(refresh):
+            refresh()
+
+
+def load_entrypoint_env(
+    *modules: Any,
+    env_path: str | os.PathLike[str] | None = None,
+    override: bool = False,
+) -> Path:
+    env_file = load_env(env_path, override=override)
+    refresh_module_settings(*modules)
+    return env_file
 
 
 def _default_service_urls() -> dict[str, str]:

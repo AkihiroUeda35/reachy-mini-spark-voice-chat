@@ -2,7 +2,6 @@ import argparse
 import asyncio
 import base64
 import io
-import importlib
 import json
 import os
 import sys
@@ -24,34 +23,27 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from websockets import connect as ws_connect
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+import local_tts
+import whisper_asr as asr_tools
+from config import load_entrypoint_env
+from langgraph_agent import LangGraphLLMProcessor
+from openai_model_registry import resolve_model
 
-importlib.import_module("lib.config").load_env()
+load_entrypoint_env(local_tts, asr_tools)
 
-_langgraph_agent = importlib.import_module("lib.langgraph_agent")
-_local_tts = importlib.import_module("lib.local_tts")
-_openai_model_registry = importlib.import_module("lib.openai_model_registry")
-asr_tools = importlib.import_module("lib.whisper_asr")
-
-LangGraphLLMProcessor = _langgraph_agent.LangGraphLLMProcessor
-CHAT_API_KEY = _local_tts.CHAT_API_KEY
-CHAT_BASE_URL = _local_tts.CHAT_BASE_URL
-CHAT_MODEL = _local_tts.CHAT_MODEL
-CHAT_MODEL_FALLBACK = _local_tts.CHAT_MODEL_FALLBACK
-TTS_API_KEY = _local_tts.TTS_API_KEY
-TTS_BASE_URL = _local_tts.TTS_BASE_URL
-TTS_INSTRUCTIONS = _local_tts.TTS_INSTRUCTIONS
-TTS_LANGUAGE = _local_tts.TTS_LANGUAGE
-TTS_MODEL = _local_tts.TTS_MODEL
-TTS_MODEL_FALLBACK = _local_tts.TTS_MODEL_FALLBACK
-TTS_SAMPLE_RATE = _local_tts.TTS_SAMPLE_RATE
-TTS_TASK_TYPE = _local_tts.TTS_TASK_TYPE
-VOICE = _local_tts.VOICE
-resolve_model = _openai_model_registry.resolve_model
-
-
+CHAT_API_KEY = local_tts.CHAT_API_KEY
+CHAT_BASE_URL = local_tts.CHAT_BASE_URL
+CHAT_MODEL = local_tts.CHAT_MODEL
+CHAT_MODEL_FALLBACK = local_tts.CHAT_MODEL_FALLBACK
+TTS_API_KEY = local_tts.TTS_API_KEY
+TTS_BASE_URL = local_tts.TTS_BASE_URL
+TTS_INSTRUCTIONS = local_tts.TTS_INSTRUCTIONS
+TTS_LANGUAGE = local_tts.TTS_LANGUAGE
+TTS_MODEL = local_tts.TTS_MODEL
+TTS_MODEL_FALLBACK = local_tts.TTS_MODEL_FALLBACK
+TTS_SAMPLE_RATE = local_tts.TTS_SAMPLE_RATE
+TTS_TASK_TYPE = local_tts.TTS_TASK_TYPE
+VOICE = local_tts.VOICE
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant Reachy(リーチー) in a spoken Japanese conversation. "

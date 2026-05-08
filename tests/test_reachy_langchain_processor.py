@@ -10,7 +10,7 @@ from pipecat.frames.frames import FunctionCallInProgressFrame, FunctionCallResul
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 
-from apps.conversation.main import ReachyLangChainProcessor
+from pipeline import ReachyLangChainProcessor
 
 
 class _StubModel:

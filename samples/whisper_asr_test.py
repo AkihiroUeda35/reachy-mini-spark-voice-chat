@@ -1,15 +1,8 @@
-from pathlib import Path
-import importlib
-import sys
+import whisper_asr
+from config import load_entrypoint_env
 
-
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-importlib.import_module("lib.config").load_env()
-main = importlib.import_module("lib.whisper_asr").main
+load_entrypoint_env(whisper_asr)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(whisper_asr.main())

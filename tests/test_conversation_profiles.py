@@ -4,15 +4,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from apps.conversation.main import (
+from main import (
     DEFAULT_CHARACTER_PROMPT,
     DEFAULT_VOICE,
-    compose_system_prompt,
     load_profile_character_prompt_by_name,
     load_profile_prompt_by_name,
     load_profile_voice_by_name,
     save_profile_definition,
 )
+from state import compose_system_prompt
 
 
 class ConversationProfileTests(unittest.TestCase):

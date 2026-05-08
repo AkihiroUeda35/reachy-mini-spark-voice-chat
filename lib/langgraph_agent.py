@@ -13,7 +13,7 @@ from pydantic import SecretStr
 from pipecat.frames.frames import ErrorFrame, LLMContextFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from lib.jma_weather_tool import get_jma_weather_tool
+from jma_weather_tool import get_jma_weather_tool
 
 
 @tool
