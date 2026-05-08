@@ -6,7 +6,7 @@ samples/.venv/
 data/*
 __pycache__/
 *.pyc
-
+.env
 */models/*
 */voices/*
 spark_voice_chat.egg-info/*
