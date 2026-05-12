@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 import logging
 import os
 import signal
@@ -27,7 +28,7 @@ from openai_model_registry import resolve_model
 
 from gradio_ui import launch_gradio_ui
 from pipeline import SynthesizedAudio, _resample_audio, run_pipeline
-from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_voice_by_name, save_profile_definition as _save_profile_definition
+from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, AssistantSpeechState, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, listening_gate_settings, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_voice_by_name, load_selected_profile_name, overlap_turn_rejection_reason, save_profile_definition as _save_profile_definition
 
 load_entrypoint_env(local_tts, asr_tools)
 
@@ -49,6 +50,13 @@ VOICE = local_tts.VOICE
 
 TTS_TRANSPORT = os.environ.get("TTS_TRANSPORT", "realtime")
 SHUTDOWN_STEP_TIMEOUT_S = 2.0
+
+
+@dataclass
+class CapturedUtterance:
+    audio: Any
+    duration_ms: float
+    overlap_gate_active: bool
 
 
 def active_tools_for_profile(profiles_dir: Path, profile: str) -> list[str]:
@@ -83,7 +91,7 @@ def configure_logging(debug: bool) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reachy Mini conversation app powered by local ASR, LLM, and TTS servers.")
     parser.add_argument("--robot-name", help="Optional Reachy Mini robot name when multiple robots are available.")
-    parser.add_argument("--profile", default="default", help="Profile name under apps/conversation/profiles.")
+    parser.add_argument("--profile", help="Profile name under apps/conversation/profiles. Defaults to the last saved selection, or 'default'.")
     parser.add_argument("--profiles-dir", default=str(APP_DIR / "profiles"), help="Directory containing profile folders.")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="Directory for captured audio and snapshots.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
@@ -94,6 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wake-up", action=argparse.BooleanOptionalAction, default=True, help="Wake the robot up on startup.")
     parser.add_argument("--history-turns", type=int, default=6, help="How many previous user+assistant turns to keep.")
     parser.add_argument("--motion-duration", type=float, default=0.8, help="Duration for simple head movements in seconds.")
+    parser.add_argument("--head-wobble", action=argparse.BooleanOptionalAction, default=True, help="Move Reachy's head while speaking synthesized replies.")
 
     parser.add_argument("--base-url", default=asr_tools.ASR_BASE_URL, help="OpenAI-compatible STT base URL.")
     parser.add_argument("--api-key", default=asr_tools.ASR_API_KEY, help="Bearer token for the STT endpoint.")
@@ -111,6 +120,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vad-end-ms", type=int, default=asr_tools.ASR_VAD_END_MS, help="Silence duration required to trigger capture end.")
     parser.add_argument("--vad-preroll-ms", type=int, default=asr_tools.ASR_VAD_PREROLL_MS, help="Audio to keep before VAD start.")
     parser.add_argument("--vad-max-seconds", type=float, default=asr_tools.ASR_VAD_MAX_SECONDS, help="Maximum capture duration per turn.")
+    parser.add_argument("--assistant-speaking-threshold-boost", type=float, default=0.005, help="Additional VAD RMS threshold applied while Reachy's own reply is still playing.")
+    parser.add_argument("--assistant-speaking-vad-start-ms", type=int, default=400, help="Minimum continuous speech required to start capture while Reachy's reply is still playing.")
+    parser.add_argument("--assistant-speaking-min-vad-ms", type=int, default=500, help="Minimum captured speech duration required to keep a turn while Reachy's reply is still playing.")
+    parser.add_argument("--assistant-speaking-min-chars", type=int, default=4, help="Minimum transcript length required to keep a turn while Reachy's reply is still playing.")
+    parser.add_argument("--assistant-speaking-tail-ms", type=int, default=350, help="Extra time after queued TTS audio where overlap protection stays active.")
     parser.add_argument("--listen-timeout-seconds", type=float, default=20.0, help="Maximum time to wait for a new utterance.")
     parser.add_argument("--audio-poll-interval-ms", type=float, default=10.0, help="Polling interval when Reachy media has no pending audio frame.")
     parser.add_argument("--save-transcripts", action=argparse.BooleanOptionalAction, default=False, help="Save STT payloads under the data directory.")
@@ -158,7 +172,11 @@ def _prepared_audio_from_pcm16(audio_bytes: bytes, *, sample_rate: int, stem: st
     )
 
 
-async def capture_robot_utterance(robot: ReachyMini, args: argparse.Namespace) -> Any | None:
+async def capture_robot_utterance(
+    robot: ReachyMini,
+    args: argparse.Namespace,
+    assistant_speech_state: AssistantSpeechState | None = None,
+) -> CapturedUtterance | None:
     logger = logging.getLogger("conversation.asr")
     input_rate = robot.media.get_input_audio_samplerate()
     poll_interval_s = max(0.001, args.audio_poll_interval_ms / 1000.0)
@@ -168,6 +186,7 @@ async def capture_robot_utterance(robot: ReachyMini, args: argparse.Namespace) -
     speech_ms = 0.0
     silence_ms = 0.0
     speech_active = False
+    overlap_gate_active = False
     preroll: deque[tuple[float, bytes]] = deque()
     preroll_ms = 0.0
     captured_chunks: list[bytes] = []
@@ -195,15 +214,24 @@ async def capture_robot_utterance(robot: ReachyMini, args: argparse.Namespace) -
         duration_ms = (len(mono) / args.sample_rate) * 1000.0
         rms = float(np.sqrt(np.mean(np.square(mono), dtype=np.float32))) if mono.size else 0.0
         pcm_chunk = asr_tools._pcm16_bytes(mono)
+        assistant_speaking = assistant_speech_state.is_speaking() if assistant_speech_state is not None else False
+        active_vad_threshold, active_vad_start_ms = listening_gate_settings(
+            args.vad_threshold,
+            args.vad_start_ms,
+            assistant_speaking=assistant_speaking,
+            speaking_threshold_boost=args.assistant_speaking_threshold_boost,
+            speaking_vad_start_ms=args.assistant_speaking_vad_start_ms,
+        )
+        overlap_gate_active = overlap_gate_active or assistant_speaking
 
         if not speech_active:
             preroll.append((duration_ms, pcm_chunk))
             preroll_ms += duration_ms
-            while preroll and preroll_ms > max(args.vad_preroll_ms, args.vad_start_ms):
+            while preroll and preroll_ms > max(args.vad_preroll_ms, active_vad_start_ms):
                 old_duration, _old_chunk = preroll.popleft()
                 preroll_ms -= old_duration
 
-        if rms >= args.vad_threshold:
+        if rms >= active_vad_threshold:
             speech_ms += duration_ms
             silence_ms = 0.0
         else:
@@ -211,10 +239,17 @@ async def capture_robot_utterance(robot: ReachyMini, args: argparse.Namespace) -
             if not speech_active:
                 speech_ms = 0.0
 
-        if not speech_active and speech_ms >= args.vad_start_ms:
+        if not speech_active and speech_ms >= active_vad_start_ms:
             speech_active = True
             capture_started_at = perf_counter()
-            logger.info("[bold blue]ASR[/] speech detected")
+            if overlap_gate_active:
+                logger.info(
+                    "[bold blue]ASR[/] speech detected with overlap gate threshold=%.4f start=%dms",
+                    active_vad_threshold,
+                    active_vad_start_ms,
+                )
+            else:
+                logger.info("[bold blue]ASR[/] speech detected")
             for _duration, buffered in preroll:
                 captured_chunks.append(buffered)
             preroll.clear()
@@ -223,21 +258,48 @@ async def capture_robot_utterance(robot: ReachyMini, args: argparse.Namespace) -
         if speech_active:
             captured_chunks.append(pcm_chunk)
             if silence_ms >= args.vad_end_ms:
+                detected_at = datetime.now().isoformat(timespec="milliseconds")
+                capture_elapsed_s = perf_counter() - capture_started_at if capture_started_at is not None else 0.0
+                logger.debug(
+                    "ASR end-of-utterance decision at %s silence=%.0fms elapsed=%.3fs",
+                    detected_at,
+                    silence_ms,
+                    capture_elapsed_s,
+                )
                 logger.info("[bold blue]ASR[/] end of utterance detected")
                 break
             if capture_started_at is not None and perf_counter() - capture_started_at >= args.vad_max_seconds:
+                logger.debug(
+                    "ASR end-of-utterance decision at %s forced_commit_elapsed=%.3fs",
+                    datetime.now().isoformat(timespec="milliseconds"),
+                    perf_counter() - capture_started_at,
+                )
                 logger.info("[bold blue]ASR[/] forcing commit after %.1fs", args.vad_max_seconds)
                 break
 
     if not captured_chunks:
         return None
 
+    captured_duration_ms = sum(len(chunk) for chunk in captured_chunks) / 2 / args.sample_rate * 1000.0
+    if overlap_gate_active and captured_duration_ms < args.assistant_speaking_min_vad_ms:
+        logger.info(
+            "[bold blue]ASR[/] ignoring overlapping short utterance vad=%.0fms < %dms",
+            captured_duration_ms,
+            args.assistant_speaking_min_vad_ms,
+        )
+        return None
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return _prepared_audio_from_pcm16(b"".join(captured_chunks), sample_rate=args.sample_rate, stem=f"reachy_turn_{timestamp}")
+    return CapturedUtterance(
+        audio=_prepared_audio_from_pcm16(b"".join(captured_chunks), sample_rate=args.sample_rate, stem=f"reachy_turn_{timestamp}"),
+        duration_ms=captured_duration_ms,
+        overlap_gate_active=overlap_gate_active,
+    )
 
 
-async def transcribe_captured_audio(args: argparse.Namespace, audio: Any) -> str | dict:
+async def transcribe_captured_audio(args: argparse.Namespace, utterance: CapturedUtterance) -> str | dict:
     logger = logging.getLogger("conversation.asr")
+    audio = utterance.audio
     logger.info("[bold blue]ASR[/] sending %.2fs of audio to %s", len(audio.pcm16_bytes) / 2 / audio.sample_rate, args.base_url)
     started_at = perf_counter()
     if args.transport == "realtime":
@@ -331,6 +393,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
     llm_logger = logging.getLogger("conversation.llm")
 
     profiles_dir = Path(args.profiles_dir).expanduser().resolve()
+    args.profile = args.profile or load_selected_profile_name(profiles_dir)
     args.system_prompt = load_profile_prompt(args)
     args.voice = load_profile_voice_by_name(profiles_dir, args.profile, args.voice or DEFAULT_VOICE)
     resolve_runtime_models(args)
@@ -351,6 +414,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
     history: list[dict[str, str]] = []
     data_dir = Path(args.data_dir).expanduser().resolve()
     last_settings_version = 0
+    assistant_speech_state = AssistantSpeechState(tail_hold_s=args.assistant_speaking_tail_ms / 1000.0)
     stop_event = asyncio.Event()
     interrupted = False
     loop = asyncio.get_running_loop()
@@ -405,25 +469,36 @@ async def conversation_loop(args: argparse.Namespace) -> int:
             args.profile = active_profile
             args.system_prompt = active_instructions
             args.voice = active_voice
-            captured_audio = await capture_robot_utterance(robot, args)
-            if captured_audio is None or stop_event.is_set():
+            captured_utterance = await capture_robot_utterance(robot, args, assistant_speech_state=assistant_speech_state)
+            if captured_utterance is None or stop_event.is_set():
                 continue
 
-            payload = await transcribe_captured_audio(args, captured_audio)
+            payload = await transcribe_captured_audio(args, captured_utterance)
             transcript_text = payload if isinstance(payload, str) else str(payload.get("text", "")).strip()
             if not transcript_text:
                 asr_logger.warning("[bold blue]ASR[/] empty transcript, skipping turn")
                 continue
 
+            if captured_utterance.overlap_gate_active:
+                rejection_reason = overlap_turn_rejection_reason(
+                    captured_duration_ms=captured_utterance.duration_ms,
+                    transcript_text=transcript_text,
+                    min_duration_ms=args.assistant_speaking_min_vad_ms,
+                    min_chars=args.assistant_speaking_min_chars,
+                )
+                if rejection_reason is not None:
+                    asr_logger.info("[bold blue]ASR[/] ignoring overlapping short utterance (%s)", rejection_reason)
+                    continue
+
             asr_logger.info("[bold blue]ASR[/] transcript %s", transcript_text)
 
             if args.save_transcripts:
-                saved = asr_tools.save_output(payload, argparse.Namespace(**{**vars(args), "output": None, "save_output": True}), captured_audio)
+                saved = asr_tools.save_output(payload, argparse.Namespace(**{**vars(args), "output": None, "save_output": True}), captured_utterance.audio)
                 if saved is not None:
                     asr_logger.info("[bold blue]ASR[/] transcript saved to %s", saved)
 
             llm_logger.info("[bold cyan]LLM[/] user %s", transcript_text)
-            result = await run_pipeline(args, runtime, transcript_text, history, active_tools)
+            result = await run_pipeline(args, runtime, transcript_text, history, active_tools, assistant_speech_state=assistant_speech_state)
             llm_logger.info("[bold cyan]LLM[/] assistant %s", result.assistant_text)
 
             history.extend(

@@ -12,7 +12,7 @@ from main import (
     load_profile_voice_by_name,
     save_profile_definition,
 )
-from state import compose_system_prompt
+from state import compose_system_prompt, load_selected_profile_name, save_selected_profile_name
 
 
 class ConversationProfileTests(unittest.TestCase):
@@ -41,6 +41,42 @@ class ConversationProfileTests(unittest.TestCase):
             prompt = load_profile_prompt_by_name(profiles_dir, "tester", DEFAULT_CHARACTER_PROMPT)
             self.assertIn("## IDENTITY", prompt)
             self.assertIn("Be playful.", prompt)
+
+    def test_selected_profile_defaults_when_file_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profiles_dir = Path(temp_dir)
+            save_profile_definition(
+                profiles_dir,
+                "tester",
+                "## CHARACTER\n\nBe playful.",
+                ["camera"],
+                "Sohee",
+            )
+
+            self.assertEqual(load_selected_profile_name(profiles_dir), "default")
+
+    def test_selected_profile_is_loaded_when_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profiles_dir = Path(temp_dir)
+            save_profile_definition(
+                profiles_dir,
+                "tester",
+                "## CHARACTER\n\nBe playful.",
+                ["camera"],
+                "Sohee",
+            )
+
+            save_selected_profile_name(profiles_dir, "tester")
+
+            self.assertEqual(load_selected_profile_name(profiles_dir), "tester")
+
+    def test_selected_profile_falls_back_when_saved_profile_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profiles_dir = Path(temp_dir)
+
+            save_selected_profile_name(profiles_dir, "tester")
+
+            self.assertEqual(load_selected_profile_name(profiles_dir), "default")
 
 
 if __name__ == "__main__":

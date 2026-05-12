@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +11,7 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_PROFILE_DIR = APP_DIR / "profiles" / "default"
 ROOT_DIR = APP_DIR.parents[1]
 DEFAULT_DATA_DIR = ROOT_DIR / "data" / "conversation"
+DEFAULT_SELECTED_PROFILE_FILE = APP_DIR / "profiles" / ".selected_profile"
 COMMON_INSTRUCTIONS_FILE = APP_DIR / "profiles" / "common_instructions.txt"
 DEFAULT_CHARACTER_FILE = DEFAULT_PROFILE_DIR / "character.txt"
 DEFAULT_TOOLS_FILE = DEFAULT_PROFILE_DIR / "tools.txt"
@@ -64,6 +66,61 @@ class RuntimeSettings:
                 self._version,
             )
 
+
+class AssistantSpeechState:
+    def __init__(self, tail_hold_s: float = 0.35) -> None:
+        self._lock = threading.Lock()
+        self._playback_end_s = 0.0
+        self._tail_hold_s = max(0.0, tail_hold_s)
+
+    def note_output_audio(self, *, sample_count: int, sample_rate: int) -> None:
+        if sample_count <= 0 or sample_rate <= 0:
+            return
+        duration_s = sample_count / sample_rate
+        now = time.monotonic()
+        with self._lock:
+            base = max(now, self._playback_end_s)
+            self._playback_end_s = base + duration_s
+
+    def is_speaking(self) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            deadline = self._playback_end_s + self._tail_hold_s
+        return now < deadline
+
+
+def listening_gate_settings(
+    base_vad_threshold: float,
+    base_vad_start_ms: int,
+    *,
+    assistant_speaking: bool,
+    speaking_threshold_boost: float,
+    speaking_vad_start_ms: int,
+) -> tuple[float, int]:
+    if not assistant_speaking:
+        return base_vad_threshold, base_vad_start_ms
+    return base_vad_threshold + max(0.0, speaking_threshold_boost), max(base_vad_start_ms, speaking_vad_start_ms)
+
+
+def transcript_char_count(text: str) -> int:
+    ignored_chars = {"、", "。", "！", "？", "!", "?", ".", ",", "，", "．", "…", "ー", "〜", "-"}
+    return sum(1 for char in text.strip() if not char.isspace() and char not in ignored_chars)
+
+
+def overlap_turn_rejection_reason(
+    *,
+    captured_duration_ms: float,
+    transcript_text: str,
+    min_duration_ms: int,
+    min_chars: int,
+) -> str | None:
+    if captured_duration_ms < max(0, min_duration_ms):
+        return f"vad {captured_duration_ms:.0f}ms < {min_duration_ms}ms"
+    char_count = transcript_char_count(transcript_text)
+    if char_count < max(0, min_chars):
+        return f"chars {char_count} < {min_chars}"
+    return None
+
     def update(
         self,
         profile: str,
@@ -111,6 +168,30 @@ def list_profile_names(profiles_dir: Path) -> list[str]:
     if "default" not in names and DEFAULT_PROFILE_DIR.is_dir():
         names.append("default")
     return sorted(set(names))
+
+
+def selected_profile_file(profiles_dir: Path) -> Path:
+    return profiles_dir / DEFAULT_SELECTED_PROFILE_FILE.name
+
+
+def load_selected_profile_name(profiles_dir: Path, fallback: str = "default") -> str:
+    normalized_fallback = normalize_profile_name(fallback) or "default"
+    stored_name = normalize_profile_name(_read_text_file(selected_profile_file(profiles_dir)))
+    if not stored_name:
+        return normalized_fallback
+    if stored_name in list_profile_names(profiles_dir):
+        return stored_name
+    return normalized_fallback
+
+
+def save_selected_profile_name(profiles_dir: Path, profile: str) -> Path:
+    normalized_profile = normalize_profile_name(profile)
+    if not normalized_profile:
+        raise ValueError("profile must be a valid name")
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    profile_file = selected_profile_file(profiles_dir)
+    profile_file.write_text(normalized_profile + "\n", encoding="utf-8")
+    return profile_file
 
 
 def active_tools_for_profile(profiles_dir: Path, profile: str, gui_tool_names: list[str]) -> list[str]:

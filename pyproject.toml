@@ -36,6 +36,7 @@ py-modules = [
     "langgraph_agent",
     "local_tts",
     "openai_model_registry",
+    "reachy_audio",
     "reachy_conversation_tools",
     "whisper_asr",
 ]

@@ -11,7 +11,7 @@ from pathlib import Path
 import gradio as gr
 
 import reachy_conversation_tools
-from state import DEFAULT_CHARACTER_PROMPT, DEFAULT_VOICE, VOICE_CHOICES, RuntimeSettings, active_tools_for_profile, compose_system_prompt, list_profile_names, load_profile_character_prompt_by_name, load_profile_voice_by_name, normalize_profile_name, save_profile_definition
+from state import DEFAULT_CHARACTER_PROMPT, DEFAULT_VOICE, VOICE_CHOICES, RuntimeSettings, active_tools_for_profile, compose_system_prompt, list_profile_names, load_profile_character_prompt_by_name, load_profile_voice_by_name, normalize_profile_name, save_profile_definition, save_selected_profile_name
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -88,6 +88,7 @@ def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings)
             compose_system_prompt(character_prompt),
             voice,
         )
+        save_selected_profile_name(profiles_dir, active_profile)
         return (
             f"Live runtime updated: character={active_profile}, voice={active_voice}, "
             f"tools={', '.join(enabled_tools) if enabled_tools else 'none'}"
@@ -98,6 +99,7 @@ def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings)
             return f"Unknown character '{profile}'. Create it first."
         profile_dir = save_profile_definition(profiles_dir, profile, character_prompt, selected_tools, voice, GUI_TOOL_NAMES)
         runtime_settings.update(profile, selected_tools, character_prompt, compose_system_prompt(character_prompt), voice)
+        save_selected_profile_name(profiles_dir, profile)
         return f"Saved character '{profile}' to {profile_dir}."
 
     def on_create(profile_name: str, character_prompt: str, selected_tools: list[str], voice: str):
@@ -132,6 +134,7 @@ def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings)
             compose_system_prompt(saved_character_prompt),
             saved_voice,
         )
+        save_selected_profile_name(profiles_dir, normalized_name)
         return (
             gr.update(choices=profile_names, value=normalized_name),
             saved_character_prompt,

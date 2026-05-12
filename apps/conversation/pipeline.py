@@ -25,6 +25,8 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pydantic import SecretStr
 from reachy_mini import ReachyMini
+from reachy_audio import HeadWobbler
+from state import AssistantSpeechState
 from websockets import connect as ws_connect
 
 from reachy_conversation_tools import ReachyToolRuntime, build_langchain_tools
@@ -124,6 +126,13 @@ def _drain_ready_segments(buffer: str, *, final: bool) -> tuple[list[str], str]:
 
 def _pcm16_to_float32(audio_bytes: bytes, num_channels: int) -> np.ndarray:
     audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    if num_channels > 1:
+        return audio.reshape(-1, num_channels)
+    return audio
+
+
+def _pcm16_frame_array(audio_bytes: bytes, num_channels: int) -> np.ndarray:
+    audio = np.frombuffer(audio_bytes, dtype=np.int16)
     if num_channels > 1:
         return audio.reshape(-1, num_channels)
     return audio
@@ -399,15 +408,36 @@ class ReachyRealtimeTTSSession:
 
 
 class ReachyAudioPlayer(FrameProcessor):
-    def __init__(self, robot: ReachyMini):
+    def __init__(self, robot: ReachyMini, *, enable_head_wobble: bool = True, assistant_speech_state: AssistantSpeechState | None = None):
         super().__init__(name="ReachyAudioPlayer")
         self._robot = robot
         self._logger = logging.getLogger("conversation.audio")
         self._started = False
+        self._head_wobbler = HeadWobbler(robot.set_target_head_pose, robot.get_current_head_pose) if enable_head_wobble else None
+        self._assistant_speech_state = assistant_speech_state
+        self._closed = False
+
+    def close(self, timeout_s: float | None = None) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._head_wobbler is None:
+            return
+        finished = self._head_wobbler.finish(timeout_s=timeout_s)
+        if timeout_s is not None and not finished:
+            self._logger.warning("Head wobble reset timed out")
+        self._head_wobbler.stop()
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, OutputAudioRawFrame):
+            if self._assistant_speech_state is not None:
+                self._assistant_speech_state.note_output_audio(
+                    sample_count=len(frame.audio) // (2 * max(1, frame.num_channels)),
+                    sample_rate=frame.sample_rate,
+                )
+            if self._head_wobbler is not None:
+                self._head_wobbler.feed_pcm(_pcm16_frame_array(frame.audio, frame.num_channels), frame.sample_rate)
             waveform = _pcm16_to_float32(frame.audio, frame.num_channels)
             output_rate = self._robot.media.get_output_audio_samplerate()
             if frame.sample_rate != output_rate:
@@ -418,6 +448,8 @@ class ReachyAudioPlayer(FrameProcessor):
             await asyncio.to_thread(self._robot.media.push_audio_sample, waveform)
         elif isinstance(frame, EndFrame):
             self._started = False
+            if self._head_wobbler is not None:
+                self._head_wobbler.request_reset_after_current_audio()
         await self.push_frame(frame, direction)
 
 
@@ -532,13 +564,18 @@ async def run_pipeline(
     transcript_text: str,
     history: list[dict[str, str]],
     enabled_tool_names: list[str],
+    assistant_speech_state: AssistantSpeechState | None = None,
 ) -> PipelineResult:
     tools = build_langchain_tools(runtime, enabled_tool_names)
     llm = ReachyLangChainProcessor(args, tools)
     trace = RichTraceProcessor()
     tts = ReachyTTSProcessor(args)
     collector = ResultCollector()
-    audio_player = ReachyAudioPlayer(runtime.robot)
+    audio_player = ReachyAudioPlayer(
+        runtime.robot,
+        enable_head_wobble=getattr(args, "head_wobble", True),
+        assistant_speech_state=assistant_speech_state,
+    )
     terminator = PipelineTerminator()
     pipeline = Pipeline([llm, trace, tts, collector, audio_player, terminator])
     task = PipelineTask(
@@ -550,7 +587,10 @@ async def run_pipeline(
     runner = _create_turn_pipeline_runner()
     runner_task = asyncio.create_task(runner.run(task))
     await task.queue_frame(LLMContextFrame(_build_llm_context(history, transcript_text)))
-    await runner_task
+    try:
+        await runner_task
+    finally:
+        await asyncio.to_thread(audio_player.close)
 
     if collector.errors:
         raise RuntimeError("; ".join(collector.errors))
