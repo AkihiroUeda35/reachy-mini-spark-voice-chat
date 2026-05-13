@@ -66,6 +66,31 @@ class RuntimeSettings:
                 self._version,
             )
 
+    def update(
+        self,
+        profile: str,
+        enabled_tools: list[str],
+        character_prompt: str,
+        instructions: str,
+        voice: str,
+    ) -> tuple[str, list[str], str, str, str, int]:
+        normalized = [tool for tool in self.gui_tool_names if tool in enabled_tools]
+        with self._lock:
+            self.active_profile = profile
+            self.enabled_tools = normalized
+            self.active_character_prompt = character_prompt.strip()
+            self.active_instructions = instructions.strip()
+            self.active_voice = voice
+            self._version += 1
+            return (
+                self.active_profile,
+                list(self.enabled_tools),
+                self.active_character_prompt,
+                self.active_instructions,
+                self.active_voice,
+                self._version,
+            )
+
 
 class AssistantSpeechState:
     def __init__(self, tail_hold_s: float = 0.35) -> None:
@@ -120,31 +145,6 @@ def overlap_turn_rejection_reason(
     if char_count < max(0, min_chars):
         return f"chars {char_count} < {min_chars}"
     return None
-
-    def update(
-        self,
-        profile: str,
-        enabled_tools: list[str],
-        character_prompt: str,
-        instructions: str,
-        voice: str,
-    ) -> tuple[str, list[str], str, str, str, int]:
-        normalized = [tool for tool in self.gui_tool_names if tool in enabled_tools]
-        with self._lock:
-            self.active_profile = profile
-            self.enabled_tools = normalized
-            self.active_character_prompt = character_prompt.strip()
-            self.active_instructions = instructions.strip()
-            self.active_voice = voice
-            self._version += 1
-            return (
-                self.active_profile,
-                list(self.enabled_tools),
-                self.active_character_prompt,
-                self.active_instructions,
-                self.active_voice,
-                self._version,
-            )
 
 
 def parse_tools_file(profile_dir: Path) -> list[str]:
