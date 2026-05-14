@@ -4,6 +4,8 @@ set -eu
 export DIFFUSION_ATTENTION_BACKEND="${DIFFUSION_ATTENTION_BACKEND:-TORCH_SDPA}"
 export FLASHINFER_DISABLE_VERSION_CHECK="${FLASHINFER_DISABLE_VERSION_CHECK:-1}"
 
+DEFAULT_DEPLOY_CONFIG="/workspace/tts/qwen3_tts.yaml"
+
 python - <<'PY'
 import os
 
@@ -27,14 +29,18 @@ PY
 
 DEPLOY_CONFIG="${QWEN_TTS_DEPLOY_CONFIG:-}"
 if [ -z "$DEPLOY_CONFIG" ]; then
-  DEPLOY_CONFIG="$(python - <<'PY' 2>/dev/null | tail -n 1
+  if [ -f "$DEFAULT_DEPLOY_CONFIG" ]; then
+    DEPLOY_CONFIG="$DEFAULT_DEPLOY_CONFIG"
+  else
+    DEPLOY_CONFIG="$(python - <<'PY' 2>/dev/null | tail -n 1
 import inspect
 from pathlib import Path
 import vllm_omni
 
 print(Path(inspect.getfile(vllm_omni)).resolve().parent / "deploy" / "qwen3_tts.yaml")
 PY
-)"
+    )"
+  fi
 fi
 
 set -- \

@@ -35,8 +35,6 @@ RUN python -m pip install --no-cache-dir /tmp/wheels/*.whl \
     && python -m pip install --no-cache-dir fastsafetensors \
     && rm -rf /tmp/wheels
 
-COPY llm/run.sh /usr/local/bin/llm-run
-RUN chmod +x /usr/local/bin/llm-run
 
 ENV HF_HOME=/models/huggingface \
     TRANSFORMERS_CACHE=/models/huggingface \
@@ -45,20 +43,28 @@ ENV HF_HOME=/models/huggingface \
 
 ENTRYPOINT ["llm-run"]
 
-FROM llm-runtime AS tts-runtime
+FROM vllm-base AS tts-runtime
 
+ARG TTS_TORCH_VERSION=2.11.0
+ARG TTS_TORCHAUDIO_VERSION=2.11.0
+ARG TTS_TORCHVISION_VERSION=0.26.0
+ARG TTS_VLLM_VERSION=0.20.1
 ARG VLLM_OMNI_REF=main
 ARG VLLM_OMNI_RUNTIME_DEPS="av>=14.0.0 omegaconf>=2.3.0 diffusers>=0.36.0 accelerate==1.12.0 cache-dit==1.3.0 torchsde>=0.2.6 openai-whisper>=20250625 imageio[ffmpeg]>=2.37.2 x-transformers>=2.12.2 prettytable>=3.8.0 aenum==3.1.16 janus>=1.0.0 pydub onnxruntime>=1.23.2"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
+    && apt-get install -y --no-install-recommends ffmpeg git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --no-cache-dir ${VLLM_OMNI_RUNTIME_DEPS} \
+RUN python -m pip uninstall -y vllm torch torchaudio torchvision \
+    && python -m pip install --no-cache-dir \
+        "torch==${TTS_TORCH_VERSION}" \
+        "torchaudio==${TTS_TORCHAUDIO_VERSION}" \
+        "torchvision==${TTS_TORCHVISION_VERSION}" \
+    && python -m pip install --no-cache-dir --no-deps "vllm==${TTS_VLLM_VERSION}" \
+    && python -m pip install --no-cache-dir ${VLLM_OMNI_RUNTIME_DEPS} \
     && python -m pip install --no-cache-dir --no-deps "git+https://github.com/vllm-project/vllm-omni.git@${VLLM_OMNI_REF}"
 
-COPY tts/run.sh /usr/local/bin/qwen3-tts-run
-RUN chmod +x /usr/local/bin/qwen3-tts-run
 
 ENV HF_HOME=/models/huggingface \
     TRANSFORMERS_CACHE=/models/huggingface \
@@ -117,7 +123,6 @@ RUN python -m pip install --upgrade pip setuptools wheel \
     && pip install dist/*.whl \
     && rm -rf /tmp/CTranslate2
 
-COPY stt/app ./app
 
 EXPOSE 8020
 

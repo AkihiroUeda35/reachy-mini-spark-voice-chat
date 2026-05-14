@@ -59,7 +59,7 @@ profile_default() {
       printf '%s' ''
       ;;
     gemma4-26b-a4b:model)
-      printf '%s' 'digitalservices/Gemma-4-26B-A4B-it-NVFP4'
+      printf '%s' 'bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4'
       ;;
     gemma4-26b-a4b:host)
       printf '%s' '0.0.0.0'
@@ -95,7 +95,7 @@ profile_default() {
       printf '%s' 'gemma4'
       ;;
     gemma4-26b-a4b:speculative_config)
-      printf '%s' '{"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}'
+      printf '%s' '{"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":3}'
       ;;
     gemma4-26b-a4b:tensor_parallel_size)
       printf '%s' '1'
@@ -107,7 +107,58 @@ profile_default() {
       printf '%s' 'vllm'
       ;;
     gemma4-26b-a4b:extra_args)
-      printf '%s' 'max-num-batched-tokens 16384'
+      printf '%s' '--max-num-batched-tokens 4096'
+      ;;
+    gemma4-e4b:model)
+      printf '%s' 'bg-digitalservices/Gemma-4-E4B-it-NVFP4'
+      ;;
+    gemma4-e4b:host)
+      printf '%s' '0.0.0.0'
+      ;;
+    gemma4-e4b:port)
+      printf '%s' '8010'
+      ;;
+    gemma4-e4b:served_model_name)
+      printf '%s' 'spark'
+      ;;
+    gemma4-e4b:quantization)
+      printf '%s' 'modelopt'
+      ;;
+    gemma4-e4b:max_model_len)
+      printf '%s' '256000'
+      ;;
+    gemma4-e4b:max_num_seqs)
+      printf '%s' '8'
+      ;;
+    gemma4-e4b:kv_cache_dtype)
+      printf '%s' 'fp8'
+      ;;
+    gemma4-e4b:gpu_memory_utilization)
+      printf '%s' '0.5'
+      ;;
+    gemma4-e4b:reasoning_parser)
+      printf '%s' 'gemma4'
+      ;;
+    gemma4-e4b:enable_auto_tool_choice)
+      printf '%s' '1'
+      ;;
+    gemma4-e4b:tool_call_parser)
+      printf '%s' 'gemma4'
+      ;;
+    gemma4-e4b:speculative_config)
+      printf '%s' '{"method":"mtp","model":"google/gemma-4-E4B-it-assistant","num_speculative_tokens":3}'
+      ;;
+    gemma4-e4b:tensor_parallel_size)
+      printf '%s' '1'
+      ;;
+    gemma4-e4b:enable_prefix_caching)
+      printf '%s' '1'
+      ;;
+    gemma4-e4b:generation_config)
+      printf '%s' 'vllm'
+      ;;
+    gemma4-e4b:extra_args)
+      printf '%s' '--enforce-eager --max-num-batched-tokens 4096'
       ;;
     *)
       printf '%s' ''
