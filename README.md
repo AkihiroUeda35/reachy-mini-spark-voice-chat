@@ -149,11 +149,25 @@ Default output:
 
 LLM:
 
-- `QWEN_LLM_MODEL`
-- `QWEN_LLM_SERVED_MODEL_NAME`
-- `QWEN_LLM_GPU_MEMORY_UTILIZATION`
-- `QWEN_LLM_MAX_MODEL_LEN`
-- `QWEN_LLM_SPECULATIVE_CONFIG`
+- `LLM_PROFILE`
+- `LLM_MODEL`
+- `LLM_SERVED_MODEL_NAME`
+- `LLM_GPU_MEMORY_UTILIZATION`
+- `LLM_MAX_MODEL_LEN`
+- `LLM_SPECULATIVE_CONFIG`
+- `LLM_TENSOR_PARALLEL_SIZE`
+- `LLM_EXTRA_ARGS`
+
+Set an optional `LLM_*` value to `none` to disable a profile default such as speculative decoding.
+
+The built-in LLM profiles are:
+
+- `qwen3.6-27b`
+- `gemma4-26b-a4b`
+
+`gemma4-26b-a4b` is configured for `nvidia/Gemma-4-26B-A4B-NVFP4` plus the Gemma 4 assistant checkpoint `google/gemma-4-26B-A4B-it-assistant` via vLLM MTP speculative decoding. This repo now pins nightly vLLM with Transformers `main`; the profile starts successfully with `--enforce-eager` and serves OpenAI-compatible `/v1/models` and `/v1/chat/completions` on model name `spark`.
+
+Use `LLM_*` variables for all LLM configuration.
 
 TTS:
 

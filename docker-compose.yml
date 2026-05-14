@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
       target: llm-runtime
       args:
-        NGC_VLLM_IMAGE: ${QWEN_LLM_NGC_VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.04-py3}
+        NGC_VLLM_IMAGE: ${LLM_NGC_VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.04-py3}
     container_name: vllm_node
     restart: unless-stopped
     network_mode: host
@@ -16,19 +16,24 @@ services:
       NCCL_IGNORE_CPU_AFFINITY: "1"
       HF_HOME: /root/.cache/huggingface
       TRANSFORMERS_CACHE: /root/.cache/huggingface
-      QWEN_LLM_MODEL: ${QWEN_LLM_MODEL:-sakamakismile/Huihui-Qwen3.6-27B-abliterated-NVFP4-MTP}
-      QWEN_LLM_HOST: 0.0.0.0
-      QWEN_LLM_PORT: "8010"
-      QWEN_LLM_SERVED_MODEL_NAME: ${QWEN_LLM_SERVED_MODEL_NAME:-spark}
-      QWEN_LLM_QUANTIZATION: ${QWEN_LLM_QUANTIZATION:-modelopt}
-      QWEN_LLM_MAX_MODEL_LEN: ${QWEN_LLM_MAX_MODEL_LEN:-262144}
-      QWEN_LLM_MAX_NUM_SEQS: ${QWEN_LLM_MAX_NUM_SEQS:-4}
-      QWEN_LLM_KV_CACHE_DTYPE: ${QWEN_LLM_KV_CACHE_DTYPE:-fp8}
-      QWEN_LLM_GPU_MEMORY_UTILIZATION: ${QWEN_LLM_GPU_MEMORY_UTILIZATION:-0.6}
-      QWEN_LLM_REASONING_PARSER: ${QWEN_LLM_REASONING_PARSER:-qwen3}
-      QWEN_LLM_ENABLE_AUTO_TOOL_CHOICE: ${QWEN_LLM_ENABLE_AUTO_TOOL_CHOICE:-1}
-      QWEN_LLM_TOOL_CALL_PARSER: ${QWEN_LLM_TOOL_CALL_PARSER:-qwen3_coder}
-      QWEN_LLM_SPECULATIVE_CONFIG: '{"method":"qwen3_5_mtp","num_speculative_tokens":4,"moe_backend":"triton"}'
+      LLM_PROFILE: ${LLM_PROFILE:-qwen3.6-27b}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_HOST: ${LLM_HOST:-}
+      LLM_PORT: ${LLM_PORT:-}
+      LLM_SERVED_MODEL_NAME: ${LLM_SERVED_MODEL_NAME:-}
+      LLM_QUANTIZATION: ${LLM_QUANTIZATION:-}
+      LLM_MAX_MODEL_LEN: ${LLM_MAX_MODEL_LEN:-}
+      LLM_MAX_NUM_SEQS: ${LLM_MAX_NUM_SEQS:-}
+      LLM_KV_CACHE_DTYPE: ${LLM_KV_CACHE_DTYPE:-}
+      LLM_GPU_MEMORY_UTILIZATION: ${LLM_GPU_MEMORY_UTILIZATION:-}
+      LLM_REASONING_PARSER: ${LLM_REASONING_PARSER:-}
+      LLM_ENABLE_AUTO_TOOL_CHOICE: ${LLM_ENABLE_AUTO_TOOL_CHOICE:-}
+      LLM_TOOL_CALL_PARSER: ${LLM_TOOL_CALL_PARSER:-}
+      LLM_SPECULATIVE_CONFIG: ${LLM_SPECULATIVE_CONFIG:-}
+      LLM_TENSOR_PARALLEL_SIZE: ${LLM_TENSOR_PARALLEL_SIZE:-}
+      LLM_ENABLE_PREFIX_CACHING: ${LLM_ENABLE_PREFIX_CACHING:-}
+      LLM_GENERATION_CONFIG: ${LLM_GENERATION_CONFIG:-}
+      LLM_EXTRA_ARGS: ${LLM_EXTRA_ARGS:-}
     volumes:
       - ~/.cache/vllm:/root/.cache/vllm
       - ~/.cache/flashinfer:/root/.cache/flashinfer

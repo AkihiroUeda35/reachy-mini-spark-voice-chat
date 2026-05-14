@@ -13,8 +13,10 @@ FROM vllm-base AS llm-runtime
 # Keep torch aligned with spark-vllm-docker's runner image unless we intentionally diverge.
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
 ARG TORCH_VERSION=2.11.0
-# Override the wheel's dependency constraint locally for models that require Transformers 5.x.
-ARG TRANSFORMERS_VERSION=5.7.0
+# Gemma 4 assistant checkpoints require a newer Transformers revision than the wheel pins.
+ARG TRANSFORMERS_REF=main
+ARG VLLM_EXTRA_INDEX_URL=https://wheels.vllm.ai/nightly
+ARG VLLM_VERSION=0.20.2rc1.dev296+g140dc2ec3
 
 RUN python -m pip uninstall -y vllm || true
 
@@ -28,19 +30,20 @@ RUN python -m pip install --no-cache-dir \
 COPY spark-vllm-docker/wheels/*.whl /tmp/wheels/
 
 RUN python -m pip install --no-cache-dir /tmp/wheels/*.whl \
-    && python -m pip install --no-cache-dir "transformers==${TRANSFORMERS_VERSION}" \
-    && python -m pip install --no-cache-dir fastsafetensors instanttensor \
+    && python -m pip install --no-cache-dir "git+https://github.com/huggingface/transformers.git@${TRANSFORMERS_REF}" \
+    && python -m pip install --no-cache-dir --pre --no-deps --extra-index-url ${VLLM_EXTRA_INDEX_URL} "vllm==${VLLM_VERSION}" \
+    && python -m pip install --no-cache-dir fastsafetensors \
     && rm -rf /tmp/wheels
 
-COPY llm/run.sh /usr/local/bin/qwen-llm-run
-RUN chmod +x /usr/local/bin/qwen-llm-run
+COPY llm/run.sh /usr/local/bin/llm-run
+RUN chmod +x /usr/local/bin/llm-run
 
 ENV HF_HOME=/models/huggingface \
     TRANSFORMERS_CACHE=/models/huggingface \
     FLASHINFER_DISABLE_VERSION_CHECK=1 \
     VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 
-ENTRYPOINT ["qwen-llm-run"]
+ENTRYPOINT ["llm-run"]
 
 FROM llm-runtime AS tts-runtime
 
