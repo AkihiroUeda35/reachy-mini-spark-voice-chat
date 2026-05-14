@@ -8,10 +8,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gradio_ui import _free_gradio_port_if_same_uv_app, _is_same_conversation_app_process
+from main import is_recoverable_llm_turn_error
 from pipeline import _create_turn_pipeline_runner
 
 
 class ConversationShutdownTests(unittest.TestCase):
+    def test_recoverable_llm_turn_error_matches_tool_round_limit(self) -> None:
+        self.assertTrue(is_recoverable_llm_turn_error(RuntimeError("LangChain agent failed: LLM exceeded the maximum tool-call rounds.")))
+
+    def test_recoverable_llm_turn_error_ignores_unrelated_failures(self) -> None:
+        self.assertFalse(is_recoverable_llm_turn_error(RuntimeError("TTS returned no audio.")))
+
     @patch("pipeline.PipelineRunner")
     def test_create_turn_pipeline_runner_disables_signal_handlers(self, mock_runner) -> None:
         _create_turn_pipeline_runner()

@@ -25,7 +25,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pydantic import SecretStr
 from reachy_mini import ReachyMini
-from reachy_audio import HeadWobbler
+from reachy_audio import HeadWobbler, get_wobble_origin_pose
 from state import AssistantSpeechState
 from websockets import connect as ws_connect
 
@@ -413,7 +413,11 @@ class ReachyAudioPlayer(FrameProcessor):
         self._robot = robot
         self._logger = logging.getLogger("conversation.audio")
         self._started = False
-        self._head_wobbler = HeadWobbler(robot.set_target_head_pose, robot.get_current_head_pose) if enable_head_wobble else None
+        self._head_wobbler = HeadWobbler(
+            robot.set_target_head_pose,
+            robot.get_current_head_pose,
+            lambda: get_wobble_origin_pose(robot),
+        ) if enable_head_wobble else None
         self._assistant_speech_state = assistant_speech_state
         self._closed = False
 

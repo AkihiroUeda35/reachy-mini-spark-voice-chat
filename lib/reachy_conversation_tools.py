@@ -28,6 +28,7 @@ from langchain_openai import ChatOpenAI
 from reachy_mini_dances_library.dance_move import DanceMove
 
 from jma_weather_tool import get_jma_weather_tool
+from reachy_audio import set_wobble_origin_pose
 
 
 logger = logging.getLogger(__name__)
@@ -466,6 +467,11 @@ class ReachyToolRuntime:
             duration=self.motion_duration_s,
             body_yaw=None,
         )
+        try:
+            current_pose = await asyncio.to_thread(self.robot.get_current_head_pose)
+        except Exception:
+            current_pose = target
+        set_wobble_origin_pose(self.robot, current_pose)
         return {"status": f"looking {direction}"}
 
     async def dance(self, move: str | None, repeat: int) -> dict[str, Any]:

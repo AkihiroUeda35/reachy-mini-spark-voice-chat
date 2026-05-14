@@ -7,12 +7,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+from reachy_mini.utils import create_head_pose
+
 from reachy_conversation_tools import ReachyToolRuntime, build_langchain_tools
+from reachy_audio import get_wobble_origin_pose
 
 
 class _FakeRobot:
     def __init__(self) -> None:
         self.moves: list[tuple[str, float]] = []
+        self.head_pose = create_head_pose(degrees=False)
 
     async def async_play_move(self, move, initial_goto_duration=0.25):
         self.moves.append((type(move).__name__, initial_goto_duration))
@@ -20,8 +25,36 @@ class _FakeRobot:
     def cancel_move(self) -> None:
         return None
 
+    def goto_target(self, *, head, duration, body_yaw=None) -> None:
+        del duration, body_yaw
+        self.head_pose = np.array(head, copy=True)
+
+    def get_current_head_pose(self) -> np.ndarray:
+        return np.array(self.head_pose, copy=True)
+
 
 class ReachyConversationToolsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_move_head_updates_speech_wobble_origin_pose(self) -> None:
+        fake_robot = _FakeRobot()
+        runtime = ReachyToolRuntime(
+            fake_robot,  # type: ignore[arg-type]
+            data_dir=Path(tempfile.mkdtemp()),
+            motion_duration_s=0.2,
+            chat_base_url="http://spark:8010/v1",
+            chat_api_key="dummy",
+            chat_model="spark",
+            auto_install_optional_deps=False,
+        )
+        try:
+            await runtime.move_head("left")
+            origin_pose = get_wobble_origin_pose(fake_robot)
+            self.assertIsNotNone(origin_pose)
+            if origin_pose is None:
+                self.fail("move_head did not store a wobble origin pose")
+            self.assertTrue(np.allclose(origin_pose, fake_robot.get_current_head_pose()))
+        finally:
+            await runtime.shutdown()
+
     async def test_dance_runtime_completes_without_llm(self) -> None:
         fake_robot = _FakeRobot()
         runtime = ReachyToolRuntime(

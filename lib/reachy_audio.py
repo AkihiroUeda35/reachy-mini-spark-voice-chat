@@ -14,9 +14,12 @@ import numpy as np
 from numpy.typing import NDArray
 from reachy_mini.utils import create_head_pose
 from reachy_mini.utils.interpolation import compose_world_offset
+from scipy.spatial.transform import Rotation as R
 
 
 logger = logging.getLogger(__name__)
+
+WOBBLE_ORIGIN_POSE_ATTR = "_speech_wobble_origin_pose"
 
 SR = 16_000
 FRAME_MS = 20
@@ -55,6 +58,21 @@ ATTACK_FR = max(1, int(VAD_ATTACK_MS / HOP_MS))
 RELEASE_FR = max(1, int(VAD_RELEASE_MS / HOP_MS))
 SWAY_ATTACK_FR = max(1, int(SWAY_ATTACK_MS / HOP_MS))
 SWAY_RELEASE_FR = max(1, int(SWAY_RELEASE_MS / HOP_MS))
+
+
+def get_wobble_origin_pose(target: Any) -> NDArray[np.float64] | None:
+    pose = getattr(target, WOBBLE_ORIGIN_POSE_ATTR, None)
+    if pose is None:
+        return None
+    return np.array(pose, dtype=np.float64, copy=True)
+
+
+def set_wobble_origin_pose(target: Any, pose: NDArray[np.float64] | None) -> None:
+    if pose is None:
+        if hasattr(target, WOBBLE_ORIGIN_POSE_ATTR):
+            delattr(target, WOBBLE_ORIGIN_POSE_ATTR)
+        return
+    setattr(target, WOBBLE_ORIGIN_POSE_ATTR, np.array(pose, dtype=np.float64, copy=True))
 
 
 def _rms_dbfs(audio: NDArray[np.float32]) -> float:
@@ -238,13 +256,17 @@ class HeadWobbler:
         self,
         set_target_head_pose: Callable[[NDArray[np.float64]], None],
         get_current_head_pose: Callable[[], NDArray[np.float64]] | None = None,
+        get_origin_head_pose: Callable[[], NDArray[np.float64] | None] | None = None,
         *,
         movement_latency_s: float = 0.2,
+        reset_center_ratio: float = 1.0,
     ) -> None:
         self._logger = logging.getLogger(f"{__name__}.wobbler")
         self._set_target_head_pose = set_target_head_pose
         self._get_current_head_pose = get_current_head_pose
+        self._get_origin_head_pose = get_origin_head_pose
         self._movement_latency_s = max(0.0, movement_latency_s)
+        self._reset_center_ratio = min(1.0, max(0.0, float(reset_center_ratio)))
         self._base_ts: float | None = None
         self._base_pose: NDArray[np.float64] | None = None
         self._hops_done = 0
@@ -330,7 +352,7 @@ class HeadWobbler:
             self.reset()
 
     def reset(self) -> None:
-        target_pose = self._base_pose.copy() if self._base_pose is not None else create_head_pose(degrees=False)
+        target_pose = self._pose_toward_origin(self._base_pose, self._capture_origin_pose(), self._reset_center_ratio)
         with self._state_lock:
             self._generation += 1
             self._base_ts = None
@@ -352,6 +374,24 @@ class HeadWobbler:
         self._set_target_head_pose(target_pose)
         self._idle_event.set()
         self._logger.debug("Head wobble reset complete")
+
+    def _pose_toward_origin(
+        self,
+        pose: NDArray[np.float64] | None,
+        origin_pose: NDArray[np.float64] | None,
+        center_ratio: float,
+    ) -> NDArray[np.float64]:
+        anchor_pose = create_head_pose(degrees=False) if origin_pose is None else origin_pose
+        if pose is None:
+            return np.array(anchor_pose, dtype=np.float64, copy=True)
+        pose_ratio = 1.0 - min(1.0, max(0.0, float(center_ratio)))
+        base_translation = np.array(pose[:3, 3], dtype=np.float64, copy=True)
+        origin_translation = np.array(anchor_pose[:3, 3], dtype=np.float64, copy=True)
+        translation = origin_translation + (base_translation - origin_translation) * pose_ratio
+        base_rotation = R.from_matrix(np.asarray(pose[:3, :3], dtype=np.float64)).as_euler("xyz")
+        origin_rotation = R.from_matrix(np.asarray(anchor_pose[:3, :3], dtype=np.float64)).as_euler("xyz")
+        rotation = origin_rotation + (base_rotation - origin_rotation) * pose_ratio
+        return create_head_pose(*translation, *rotation, degrees=False)
 
     def _ensure_started(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -470,3 +510,15 @@ class HeadWobbler:
         except Exception:
             logger.debug("Falling back to neutral head pose for speech wobble base", exc_info=True)
             return create_head_pose(degrees=False)
+
+    def _capture_origin_pose(self) -> NDArray[np.float64] | None:
+        if self._get_origin_head_pose is None:
+            return None
+        try:
+            pose = self._get_origin_head_pose()
+        except Exception:
+            logger.debug("Falling back to neutral head pose for speech wobble origin", exc_info=True)
+            return None
+        if pose is None:
+            return None
+        return np.array(pose, copy=True)

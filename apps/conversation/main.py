@@ -161,6 +161,14 @@ def _mono_audio(audio: np.ndarray) -> np.ndarray:
     return normalized.mean(axis=1)
 
 
+def is_recoverable_llm_turn_error(error: Exception) -> bool:
+    message = str(error)
+    return (
+        "LangChain agent failed:" in message
+        or "LLM exceeded the maximum tool-call rounds." in message
+    )
+
+
 def _prepared_audio_from_pcm16(audio_bytes: bytes, *, sample_rate: int, stem: str) -> Any:
     return asr_tools.PreparedAudio(
         source_stem=stem,
@@ -498,7 +506,13 @@ async def conversation_loop(args: argparse.Namespace) -> int:
                     asr_logger.info("[bold blue]ASR[/] transcript saved to %s", saved)
 
             llm_logger.info("[bold cyan]LLM[/] user %s", transcript_text)
-            result = await run_pipeline(args, runtime, transcript_text, history, active_tools, assistant_speech_state=assistant_speech_state)
+            try:
+                result = await run_pipeline(args, runtime, transcript_text, history, active_tools, assistant_speech_state=assistant_speech_state)
+            except RuntimeError as exc:
+                if is_recoverable_llm_turn_error(exc):
+                    llm_logger.warning("[bold cyan]LLM[/] turn aborted without reply: %s", exc)
+                    continue
+                raise
             llm_logger.info("[bold cyan]LLM[/] assistant %s", result.assistant_text)
 
             history.extend(
