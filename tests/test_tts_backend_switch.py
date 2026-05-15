@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
+
 
 def _load_voice_server_module():
     module_name = "test_voice_server_main"
@@ -90,6 +92,44 @@ class TTSBackendSwitchTests(unittest.TestCase):
             self.assertAlmostEqual(payload["alpha"], 0.2)
             self.assertAlmostEqual(payload["beta"], 0.4)
             self.assertAlmostEqual(payload["speed"], 1.25)
+
+    def test_tsukasa_payload_uses_backend_specific_voice_from_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            voices_path = Path(temp_dir) / "voices.json"
+            voices_path.write_text(
+                json.dumps(
+                    {
+                        "captain": {
+                            "voice": "audio_ref",
+                            "diffusion_steps": 7,
+                            "embedding_scale": 1.5,
+                            "alpha": 0.2,
+                            "beta": 0.4,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "TTS_BACKEND": "tsukasa-speech",
+                    "QWEN_TTS_VOICES_FILE": str(voices_path),
+                },
+                clear=False,
+            ):
+                request = VOICE_SERVER.SpeechRequest(
+                    model="tts-1",
+                    input="こんにちは",
+                    voice={"tsukasa-speech": "captain", "qwen3-tts": "Ryan"},
+                    language="Japanese",
+                    stream=False,
+                )
+                payload = VOICE_SERVER._tsukasa_payload(request)
+
+            self.assertEqual(payload["voice"], "audio_ref")
+            self.assertEqual(payload["diffusion_steps"], 7)
 
     def test_tsukasa_payload_forwards_prompt_instructions(self) -> None:
         with patch.dict(
@@ -183,6 +223,30 @@ class TTSBackendSwitchTests(unittest.TestCase):
             self.assertEqual(VOICE_SERVER._normalize_voice_for_backend("default", "qwen3-tts"), "ono_anna")
             self.assertEqual(VOICE_SERVER._normalize_voice_for_backend("Sohee", "qwen3-tts"), "sohee")
 
+    def test_qwen_voice_normalization_uses_backend_specific_mapping(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "QWEN_TTS_DEFAULT_VOICE": "ono_anna",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                VOICE_SERVER._normalize_voice_for_backend(
+                    {"tsukasa-speech": "captain", "qwen3-tts": "Ryan"},
+                    "qwen3-tts",
+                ),
+                "ryan",
+            )
+            self.assertEqual(
+                VOICE_SERVER._normalize_voice_for_backend(
+                    {"tsukasa-speech": "captain", "qwen3-tts": "Ryan"},
+                    "tsukasa-speech",
+                ),
+                "captain",
+            )
+
+
     def test_warmup_uses_backend_specific_default_voice(self) -> None:
         with patch.dict(
             os.environ,
@@ -210,6 +274,25 @@ class TTSBackendSwitchTests(unittest.TestCase):
 
         VOICE_SERVER._apply_detected_tts_language(session, "ja")
         self.assertEqual(session.language, "Japanese")
+
+    def test_realtime_session_update_accepts_voice_mapping(self) -> None:
+        with TestClient(VOICE_SERVER.app) as client:
+            with client.websocket_connect("/v1/realtime") as websocket:
+                created = websocket.receive_json()
+                self.assertEqual(created["type"], "session.created")
+
+                websocket.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "voice": {"tsukasa-speech": "captain", "qwen3-tts": "Ryan"},
+                            "language": "Japanese",
+                        },
+                    }
+                )
+                updated = websocket.receive_json()
+                self.assertEqual(updated["type"], "session.updated")
+                self.assertEqual(updated["session"]["voice"], {"tsukasa-speech": "captain", "qwen3-tts": "Ryan"})
 
 
 if __name__ == "__main__":

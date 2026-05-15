@@ -8,7 +8,9 @@ from main import (
     DEFAULT_CHARACTER_PROMPT,
     DEFAULT_TTS_INSTRUCTIONS,
     DEFAULT_VOICE,
+    build_tts_request_voice,
     load_profile_character_prompt_by_name,
+    load_profile_qwen_voice_by_name,
     load_profile_prompt_by_name,
     load_profile_tts_instructions_by_name,
     load_profile_voice_by_name,
@@ -41,6 +43,7 @@ class ConversationProfileTests(unittest.TestCase):
                 "## CHARACTER\n\nBe playful.",
             )
             self.assertEqual(load_profile_voice_by_name(profiles_dir, "tester", DEFAULT_VOICE), "Sohee")
+            self.assertEqual(load_profile_qwen_voice_by_name(profiles_dir, "tester"), "Sohee")
             self.assertEqual(
                 load_profile_tts_instructions_by_name(profiles_dir, "tester", DEFAULT_TTS_INSTRUCTIONS),
                 "Speak with gentle enthusiasm.",
@@ -48,6 +51,56 @@ class ConversationProfileTests(unittest.TestCase):
             prompt = load_profile_prompt_by_name(profiles_dir, "tester", DEFAULT_CHARACTER_PROMPT)
             self.assertIn("## IDENTITY", prompt)
             self.assertIn("Be playful.", prompt)
+
+    def test_save_preserves_qwen_voice_txt_when_profile_voice_is_tsukasa(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profiles_dir = Path(temp_dir)
+            tester_dir = profiles_dir / "tester"
+            tester_dir.mkdir(parents=True, exist_ok=True)
+            (tester_dir / "voice.txt").write_text("Ryan\n", encoding="utf-8")
+
+            save_profile_definition(
+                profiles_dir,
+                "tester",
+                "## CHARACTER\n\nBe playful.",
+                ["move_head", "camera"],
+                "captain",
+                "Speak with gentle enthusiasm.",
+            )
+
+            self.assertEqual(load_profile_voice_by_name(profiles_dir, "tester", DEFAULT_VOICE), "captain")
+            self.assertEqual(load_profile_qwen_voice_by_name(profiles_dir, "tester"), "Ryan")
+            self.assertEqual(
+                build_tts_request_voice(
+                    load_profile_voice_by_name(profiles_dir, "tester", DEFAULT_VOICE),
+                    load_profile_qwen_voice_by_name(profiles_dir, "tester"),
+                ),
+                {"tsukasa-speech": "captain", "qwen3-tts": "Ryan"},
+            )
+
+    def test_save_persists_qwen_voice_in_voice_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profiles_dir = Path(temp_dir)
+            tester_dir = profiles_dir / "tester"
+            tester_dir.mkdir(parents=True, exist_ok=True)
+            (tester_dir / "voice.json").write_text(
+                '{\n  "voice": "captain",\n  "qwen_voice": "Ryan",\n  "tts_instructions": "Speak with gentle enthusiasm."\n}\n',
+                encoding="utf-8",
+            )
+
+            save_profile_definition(
+                profiles_dir,
+                "tester",
+                "## CHARACTER\n\nBe playful.",
+                ["move_head", "camera"],
+                "captain",
+                "Speak with gentle enthusiasm.",
+            )
+
+            self.assertEqual(load_profile_qwen_voice_by_name(profiles_dir, "tester"), "Ryan")
+            saved_payload = (tester_dir / "voice.json").read_text(encoding="utf-8")
+            self.assertIn('"qwen_voice": "Ryan"', saved_payload)
+            self.assertFalse((tester_dir / "voice.txt").exists())
 
     def test_selected_profile_defaults_when_file_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

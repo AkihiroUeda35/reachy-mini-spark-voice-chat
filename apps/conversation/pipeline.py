@@ -104,6 +104,20 @@ async def _wait_for_event(websocket, event_types: set[str]) -> dict[str, Any]:
         if payload.get("type") in event_types:
             return payload
 
+def _contains_japanese(text: str) -> bool:
+    return any(
+        ("ぁ" <= char <= "ん")
+        or ("ァ" <= char <= "ン")
+        or ("一" <= char <= "龯")
+        for char in text
+    )
+
+def _is_probably_english_text(text: str) -> bool:
+    if _contains_japanese(text):
+        return False
+    latin_count = sum(1 for char in text if char.isascii() and char.isalpha())
+    return latin_count >= 3
+
 
 def _drain_ready_segments(
     buffer: str,
@@ -115,6 +129,9 @@ def _drain_ready_segments(
     segments: list[str] = []
     start = 0
     consecutive_newlines = 0
+    english_like = _is_probably_english_text(buffer)
+    effective_max_chars = max_chars * 3 if english_like and max_chars > 0 else max_chars
+    split_punctuation = {"。", ".", ")"}
     for index, char in enumerate(buffer):
         if char == "\n":
             consecutive_newlines += 1
@@ -125,7 +142,7 @@ def _drain_ready_segments(
         should_split = False
         if newline_threshold > 0 and consecutive_newlines >= newline_threshold:
             should_split = True
-        elif max_chars > 0 and len(segment.strip()) >= max_chars:
+        elif effective_max_chars > 0 and len(segment.strip()) >= effective_max_chars and char in split_punctuation:
             should_split = True
 
         if should_split:

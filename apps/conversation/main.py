@@ -28,7 +28,7 @@ from openai_model_registry import resolve_model
 
 from gradio_ui import launch_gradio_ui
 from pipeline import SynthesizedAudio, _resample_audio, run_pipeline
-from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, DEFAULT_TTS_INSTRUCTIONS, AssistantSpeechState, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, listening_gate_settings, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_tts_instructions_by_name, load_profile_voice_by_name, load_selected_profile_name, overlap_turn_rejection_reason, save_profile_definition as _save_profile_definition
+from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, DEFAULT_TTS_INSTRUCTIONS, AssistantSpeechState, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, build_tts_request_voice, listening_gate_settings, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_qwen_voice_by_name, load_profile_tts_instructions_by_name, load_profile_voice_by_name, load_selected_profile_name, overlap_turn_rejection_reason, save_profile_definition as _save_profile_definition
 
 load_entrypoint_env(local_tts, asr_tools)
 
@@ -414,7 +414,11 @@ async def conversation_loop(args: argparse.Namespace) -> int:
     profiles_dir = Path(args.profiles_dir).expanduser().resolve()
     args.profile = args.profile or load_selected_profile_name(profiles_dir)
     args.system_prompt = load_profile_prompt(args)
-    args.voice = load_profile_voice_by_name(profiles_dir, args.profile, args.voice or DEFAULT_VOICE)
+    primary_voice = load_profile_voice_by_name(profiles_dir, args.profile, args.voice or DEFAULT_VOICE)
+    args.voice = build_tts_request_voice(
+        primary_voice,
+        load_profile_qwen_voice_by_name(profiles_dir, args.profile),
+    )
     args.tts_instructions = load_profile_tts_instructions_by_name(profiles_dir, args.profile, args.tts_instructions or DEFAULT_TTS_INSTRUCTIONS)
     resolve_runtime_models(args)
     runtime_settings = RuntimeSettings(
@@ -423,7 +427,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
         enabled_tools=active_tools_for_profile(profiles_dir, args.profile),
         active_character_prompt=load_profile_character_prompt_by_name(profiles_dir, args.profile, DEFAULT_CHARACTER_PROMPT),
         active_instructions=load_profile_prompt_by_name(profiles_dir, args.profile, DEFAULT_CHARACTER_PROMPT),
-        active_voice=load_profile_voice_by_name(profiles_dir, args.profile, args.voice or DEFAULT_VOICE),
+        active_voice=primary_voice,
         active_tts_instructions=load_profile_tts_instructions_by_name(profiles_dir, args.profile, args.tts_instructions or DEFAULT_TTS_INSTRUCTIONS),
         gui_tool_names=GUI_TOOL_NAMES,
     )
@@ -489,7 +493,10 @@ async def conversation_loop(args: argparse.Namespace) -> int:
                 app_logger.info("[bold]Conversation history reset[/] profile=%s", active_profile)
             args.profile = active_profile
             args.system_prompt = active_instructions
-            args.voice = active_voice
+            args.voice = build_tts_request_voice(
+                active_voice,
+                load_profile_qwen_voice_by_name(profiles_dir, active_profile),
+            )
             args.tts_instructions = active_tts_instructions
             captured_utterance = await capture_robot_utterance(robot, args, assistant_speech_state=assistant_speech_state)
             if captured_utterance is None or stop_event.is_set():

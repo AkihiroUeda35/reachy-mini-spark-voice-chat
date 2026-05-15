@@ -267,7 +267,15 @@ def _default_voice_for_backend(backend: str) -> str:
 
 def _normalize_voice_for_backend(voice: str | dict[str, str], backend: str) -> str | dict[str, str]:
     if isinstance(voice, dict):
-        return voice
+        candidates = [
+            voice.get(backend),
+            voice.get("qwen3-tts" if backend == "qwen3-tts" else "tsukasa-speech"),
+            voice.get("qwen" if backend == "qwen3-tts" else "tsukasa"),
+            voice.get("default"),
+            voice.get("name"),
+            voice.get("id"),
+        ]
+        voice = next((candidate.strip() for candidate in candidates if isinstance(candidate, str) and candidate.strip()), "")
 
     normalized = voice.strip()
     if backend != "qwen3-tts":
@@ -704,8 +712,10 @@ def _resample_audio(audio: np.ndarray, source_rate: int, target_rate: int) -> np
 
 
 def _tsukasa_voice_settings(req: "SpeechRequest") -> dict[str, Any]:
-    voice_cfg = _voice_config(_voice_name(req.voice))
-    requested_voice = req.voice if isinstance(req.voice, str) else ""
+    normalized_voice = _normalize_voice_for_backend(req.voice, "tsukasa-speech")
+    voice_name_or_id = _voice_name(normalized_voice)
+    voice_cfg = _voice_config(voice_name_or_id)
+    requested_voice = normalized_voice if isinstance(normalized_voice, str) else ""
     ref_audio = str(
         voice_cfg.get("voice_ref")
         or voice_cfg.get("reference_wav")
@@ -885,7 +895,7 @@ class SpeechRequest(BaseModel):
 
 class RealtimeSession(BaseModel):
     model: str = Field(default_factory=_tts_public_model_name)
-    voice: str = Field(default_factory=lambda: _env("TTS_DEFAULT_VOICE", _env("QWEN_TTS_DEFAULT_VOICE", "Ono_Anna")))
+    voice: str | dict[str, str] = Field(default_factory=lambda: _env("TTS_DEFAULT_VOICE", _env("QWEN_TTS_DEFAULT_VOICE", "Ono_Anna")))
     instructions: str = ""
     input_text: str = ""
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] = Field(default_factory=_default_task_type)
@@ -1297,6 +1307,14 @@ async def realtime_socket(websocket: WebSocket):
                     session.model = payload["model"].strip()
                 if isinstance(payload.get("voice"), str) and payload["voice"].strip():
                     session.voice = payload["voice"].strip()
+                elif isinstance(payload.get("voice"), dict):
+                    voice_map = {
+                        key.strip(): value.strip()
+                        for key, value in payload["voice"].items()
+                        if isinstance(key, str) and key.strip() and isinstance(value, str) and value.strip()
+                    }
+                    if voice_map:
+                        session.voice = voice_map
                 if isinstance(payload.get("instructions"), str):
                     session.instructions = payload["instructions"]
                 if isinstance(payload.get("task_type"), str) and payload["task_type"] in {"CustomVoice", "VoiceDesign", "Base"}:

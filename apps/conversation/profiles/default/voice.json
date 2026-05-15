@@ -1,4 +1,5 @@
 {
   "voice": "default",
+  "qwen_voice": "Ono_Anna",
   "tts_instructions": "Speak in natural Japanese with clear emotion, smooth pacing, and a vivid but easy-to-listen tone."
 }

@@ -42,6 +42,19 @@ VOICE_CHOICES: list[tuple[str, str]] = [
     ("Sohee", "Warm Korean female voice with rich emotion. [Korean]"),
 ]
 
+QWEN_VOICE_CHOICES: dict[str, str] = {
+    "aiden": "Aiden",
+    "dylan": "Dylan",
+    "eric": "Eric",
+    "ono_anna": "Ono_Anna",
+    "ryan": "Ryan",
+    "serena": "Serena",
+    "sohee": "Sohee",
+    "uncle_fu": "Uncle_Fu",
+    "vivian": "Vivian",
+}
+DEFAULT_QWEN_VOICE = "Ono_Anna"
+
 
 def _read_text_file(path: Path, fallback: str = "") -> str:
     if path.is_file():
@@ -249,8 +262,17 @@ def _profile_voice_config_path(profile_dir: Path) -> Path:
     return profile_dir / "voice.json"
 
 
+def _profile_qwen_voice_path(profile_dir: Path) -> Path:
+    return profile_dir / "voice.txt"
+
+
+def _canonical_qwen_voice(voice: str) -> str:
+    return QWEN_VOICE_CHOICES.get(voice.strip().lower(), "")
+
+
 def _load_profile_voice_config(profile_dir: Path) -> dict[str, str]:
     config_path = _profile_voice_config_path(profile_dir)
+    legacy_qwen_voice = _canonical_qwen_voice(_read_text_file(_profile_qwen_voice_path(profile_dir), ""))
     if config_path.is_file():
         try:
             payload = json.loads(config_path.read_text(encoding="utf-8"))
@@ -258,15 +280,18 @@ def _load_profile_voice_config(profile_dir: Path) -> dict[str, str]:
             payload = {}
         if isinstance(payload, dict):
             voice = str(payload.get("voice") or "").strip()
+            qwen_voice = _canonical_qwen_voice(str(payload.get("qwen_voice") or "")) or legacy_qwen_voice
             tts_instructions = str(payload.get("tts_instructions") or "").strip()
             return {
                 "voice": voice,
+                "qwen_voice": qwen_voice,
                 "tts_instructions": tts_instructions,
             }
 
-    legacy_voice = _read_text_file(profile_dir / "voice.txt", "").strip()
+    legacy_voice = _read_text_file(_profile_qwen_voice_path(profile_dir), "").strip()
     return {
         "voice": legacy_voice,
+        "qwen_voice": _canonical_qwen_voice(legacy_voice),
         "tts_instructions": "",
     }
 
@@ -289,6 +314,25 @@ def load_profile_tts_instructions_by_name(
     return tts_instructions or fallback
 
 
+def load_profile_qwen_voice_by_name(profiles_dir: Path, profile: str, fallback: str = DEFAULT_QWEN_VOICE) -> str:
+    profile_dir = profiles_dir / profile
+    qwen_voice = _load_profile_voice_config(profile_dir).get("qwen_voice", "").strip()
+    return qwen_voice or fallback
+
+
+def build_tts_request_voice(voice: str, qwen_voice: str) -> str | dict[str, str]:
+    primary_voice = voice.strip()
+    normalized_qwen_voice = _canonical_qwen_voice(qwen_voice)
+    if primary_voice and normalized_qwen_voice:
+        return {
+            "tsukasa-speech": primary_voice,
+            "qwen3-tts": normalized_qwen_voice,
+        }
+    if normalized_qwen_voice:
+        return normalized_qwen_voice
+    return primary_voice or DEFAULT_VOICE
+
+
 def save_profile_definition(
     profiles_dir: Path,
     profile: str,
@@ -300,13 +344,16 @@ def save_profile_definition(
 ) -> Path:
     profile_dir = profiles_dir / profile
     profile_dir.mkdir(parents=True, exist_ok=True)
+    existing_qwen_voice = _load_profile_voice_config(profile_dir).get("qwen_voice", "").strip()
     (profile_dir / "character.txt").write_text(character_prompt.strip() + "\n", encoding="utf-8")
     ordered_tools = [tool for tool in gui_tool_names if tool in selected_tools]
     (profile_dir / "tools.txt").write_text("\n".join(ordered_tools) + "\n", encoding="utf-8")
+    qwen_voice = _canonical_qwen_voice(voice) or existing_qwen_voice or DEFAULT_QWEN_VOICE
     _profile_voice_config_path(profile_dir).write_text(
         json.dumps(
             {
                 "voice": voice.strip(),
+                "qwen_voice": qwen_voice,
                 "tts_instructions": tts_instructions.strip(),
             },
             ensure_ascii=False,

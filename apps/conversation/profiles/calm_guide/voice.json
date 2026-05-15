@@ -1,4 +1,5 @@
 {
   "voice": "calm_guide",
+  "qwen_voice": "Serena",
   "tts_instructions": "Speak softly and steadily in Japanese, with a reassuring, thoughtful tone and gentle pacing."
 }
