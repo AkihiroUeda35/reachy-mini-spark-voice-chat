@@ -199,6 +199,44 @@ def _json_preview(payload: Any, max_len: int = 240) -> str:
     return raw[: max_len - 3] + "..."
 
 
+def _tts_backend_override(args: argparse.Namespace) -> str:
+    backend = getattr(args, "tts_backend", None)
+    if not isinstance(backend, str):
+        return ""
+    return backend.strip()
+
+
+def _tts_session_update_payload(args: argparse.Namespace) -> dict[str, Any]:
+    session: dict[str, Any] = {
+        "model": args.tts_model,
+        "voice": args.voice,
+        "instructions": args.tts_instructions,
+        "task_type": args.tts_task_type,
+        "language": args.tts_language,
+    }
+    backend = _tts_backend_override(args)
+    if backend:
+        session["backend"] = backend
+    return session
+
+
+def _tts_http_request_payload(args: argparse.Namespace, text: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": args.tts_model,
+        "task_type": args.tts_task_type,
+        "language": args.tts_language,
+        "voice": args.voice,
+        "input": text,
+        "instructions": args.tts_instructions,
+        "response_format": "pcm",
+        "stream": True,
+    }
+    backend = _tts_backend_override(args)
+    if backend:
+        payload["backend"] = backend
+    return payload
+
+
 TOOL_CHECK_SENTINEL = "No"
 
 
@@ -435,13 +473,7 @@ class ReachyRealtimeTTSSession:
             json.dumps(
                 {
                     "type": "session.update",
-                    "session": {
-                        "model": self._args.tts_model,
-                        "voice": self._args.voice,
-                        "instructions": self._args.tts_instructions,
-                        "task_type": self._args.tts_task_type,
-                        "language": self._args.tts_language,
-                    },
+                    "session": _tts_session_update_payload(self._args),
                 }
             )
         )
@@ -552,16 +584,7 @@ class PipelineTerminator(FrameProcessor):
 
 
 async def synthesize_audio_stream(args: argparse.Namespace, text: str):
-    payload = {
-        "model": args.tts_model,
-        "task_type": args.tts_task_type,
-        "language": args.tts_language,
-        "voice": args.voice,
-        "input": text,
-        "instructions": args.tts_instructions,
-        "response_format": "pcm",
-        "stream": True,
-    }
+    payload = _tts_http_request_payload(args, text)
     async with httpx.AsyncClient(timeout=TTS_TIMEOUT) as client:
         async with client.stream(
             "POST",

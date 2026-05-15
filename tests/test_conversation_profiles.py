@@ -35,6 +35,7 @@ class ConversationProfileTests(unittest.TestCase):
                 "## CHARACTER\n\nBe playful.",
                 ["move_head", "camera"],
                 "Sohee",
+                None,
                 "Speak with gentle enthusiasm.",
             )
 
@@ -65,6 +66,7 @@ class ConversationProfileTests(unittest.TestCase):
                 "## CHARACTER\n\nBe playful.",
                 ["move_head", "camera"],
                 "captain",
+                None,
                 "Speak with gentle enthusiasm.",
             )
 
@@ -94,6 +96,7 @@ class ConversationProfileTests(unittest.TestCase):
                 "## CHARACTER\n\nBe playful.",
                 ["move_head", "camera"],
                 "captain",
+                None,
                 "Speak with gentle enthusiasm.",
             )
 
@@ -111,6 +114,7 @@ class ConversationProfileTests(unittest.TestCase):
                 "## CHARACTER\n\nBe playful.",
                 ["camera"],
                 "Sohee",
+                None,
                 DEFAULT_TTS_INSTRUCTIONS,
             )
 
@@ -125,8 +129,26 @@ class ConversationProfileTests(unittest.TestCase):
                 "## CHARACTER\n\nBe playful.",
                 ["camera"],
                 "Sohee",
+                None,
                 DEFAULT_TTS_INSTRUCTIONS,
             )
+
+    def test_save_persists_explicit_qwen_voice_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profiles_dir = Path(temp_dir)
+
+            save_profile_definition(
+                profiles_dir,
+                "tester",
+                "## CHARACTER\n\nBe playful.",
+                ["camera"],
+                "samurai",
+                "Ryan",
+                DEFAULT_TTS_INSTRUCTIONS,
+            )
+
+            self.assertEqual(load_profile_voice_by_name(profiles_dir, "tester", DEFAULT_VOICE), "samurai")
+            self.assertEqual(load_profile_qwen_voice_by_name(profiles_dir, "tester"), "Ryan")
 
             save_selected_profile_name(profiles_dir, "tester")
 

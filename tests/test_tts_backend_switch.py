@@ -212,6 +212,25 @@ class TTSBackendSwitchTests(unittest.TestCase):
 
             self.assertEqual(VOICE_SERVER._tts_backend_for_request(request), "tsukasa-speech")
 
+    def test_explicit_request_backend_overrides_env_default(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TTS_BACKEND": "tsukasa-speech",
+            },
+            clear=False,
+        ):
+            request = VOICE_SERVER.SpeechRequest(
+                model="tts-1",
+                input="こんにちは、リーチー。",
+                backend="qwen",
+                voice="default",
+                language="Japanese",
+                stream=False,
+            )
+
+            self.assertEqual(VOICE_SERVER._tts_backend_for_request(request), "qwen3-tts")
+
     def test_qwen_voice_normalization_falls_back_from_tsukasa_default(self) -> None:
         with patch.dict(
             os.environ,
@@ -293,6 +312,24 @@ class TTSBackendSwitchTests(unittest.TestCase):
                 updated = websocket.receive_json()
                 self.assertEqual(updated["type"], "session.updated")
                 self.assertEqual(updated["session"]["voice"], {"tsukasa-speech": "captain", "qwen3-tts": "Ryan"})
+
+    def test_realtime_session_update_accepts_backend_override(self) -> None:
+        with TestClient(VOICE_SERVER.app) as client:
+            with client.websocket_connect("/v1/realtime") as websocket:
+                created = websocket.receive_json()
+                self.assertEqual(created["type"], "session.created")
+
+                websocket.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "backend": "qwen",
+                        },
+                    }
+                )
+                updated = websocket.receive_json()
+                self.assertEqual(updated["type"], "session.updated")
+                self.assertEqual(updated["session"]["backend"], "qwen3-tts")
 
 
 if __name__ == "__main__":

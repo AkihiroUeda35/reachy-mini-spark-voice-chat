@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import threading
 import time
+from urllib import error, request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,15 +24,9 @@ DEFAULT_VOICE = "default"
 DEFAULT_TTS_INSTRUCTIONS = local_tts.TTS_INSTRUCTIONS
 
 VOICE_CHOICES: list[tuple[str, str]] = [
-    ("default", "Balanced default Tsukasa preset with natural pacing. [Tsukasa]"),
-    ("calm_guide", "Soft, reassuring Tsukasa preset for calm guidance. [Tsukasa]"),
-    ("captain", "Bold, energetic Tsukasa preset for adventurous banter. [Tsukasa]"),
-    ("lively_friend", "Bright, playful Tsukasa preset for friendly conversation. [Tsukasa]"),
-    ("operator", "Clean, restrained Tsukasa preset for concise answers. [Tsukasa]"),
-    ("samurai", "Measured, dignified Tsukasa preset with stronger weight. [Tsukasa]"),
-    ("shiki_fine05", "Refined direct Tsukasa reference voice. [Tsukasa]"),
-    ("kaede_san", "Gentle direct Tsukasa reference voice. [Tsukasa]"),
-    ("audio_ref", "Neutral bundled Tsukasa reference voice. [Tsukasa]"),
+    ("audio_ref", "Bundled Tsukasa reference voice. [Tsukasa]"),
+    ("kaede_san", "Gentle Tsukasa reference voice. [Tsukasa]"),
+    ("shiki_fine05", "Refined Tsukasa reference voice. [Tsukasa]"),
     ("Vivian", "Bright, slightly edgy young female voice. [Chinese]"),
     ("Serena", "Warm, gentle young female voice. [Chinese]"),
     ("Uncle_Fu", "Seasoned male voice with a low, mellow timbre. [Chinese]"),
@@ -55,6 +51,66 @@ QWEN_VOICE_CHOICES: dict[str, str] = {
 }
 DEFAULT_QWEN_VOICE = "Ono_Anna"
 
+TSUKASA_SPEECH_BASE_URL = os.environ.get("TSUKASA_SPEECH_BASE_URL", "http://localhost:5001").rstrip("/")
+
+
+def _fetch_tsukasa_voice_catalog(base_url: str | None = None, timeout_s: float = 1.0) -> tuple[list[str], str]:
+    voice_base_url = (base_url or TSUKASA_SPEECH_BASE_URL).rstrip("/")
+    if not voice_base_url:
+        return [], ""
+    try:
+        with request.urlopen(f"{voice_base_url}/voices", timeout=timeout_s) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, error.URLError):
+        return [], ""
+    voices = payload.get("voices") if isinstance(payload, dict) else None
+    if not isinstance(voices, list):
+        return [], ""
+    default_voice = str(payload.get("default_voice") or "").strip() if isinstance(payload, dict) else ""
+    normalized_voices = [str(voice).strip() for voice in voices if str(voice).strip()]
+    return normalized_voices, default_voice
+
+
+def _fetch_tsukasa_voice_names(base_url: str | None = None, timeout_s: float = 1.0) -> list[str]:
+    voices, _default_voice = _fetch_tsukasa_voice_catalog(base_url=base_url, timeout_s=timeout_s)
+    return voices
+
+
+def normalize_tsukasa_voice(voice: str, base_url: str | None = None) -> str:
+    requested_voice = voice.strip()
+    if not requested_voice:
+        return requested_voice
+
+    voices, default_voice = _fetch_tsukasa_voice_catalog(base_url=base_url)
+    if not voices:
+        return requested_voice
+    if requested_voice in voices:
+        return requested_voice
+    if default_voice and default_voice in voices:
+        return default_voice
+    return voices[0]
+
+
+def tsukasa_voice_choices(current_voice: str = "", base_url: str | None = None) -> list[tuple[str, str]]:
+    live_voices = _fetch_tsukasa_voice_names(base_url=base_url)
+    if live_voices:
+        choices = [(voice, "Live Tsukasa voice from /voices. [Tsukasa]") for voice in live_voices]
+    else:
+        choices = [
+            (name, description)
+            for name, description in VOICE_CHOICES
+            if "[Tsukasa]" in description
+        ]
+
+    current_value = current_voice.strip()
+    if current_value and all(name != current_value for name, _description in choices):
+        choices.insert(0, (current_value, "Saved profile value not advertised by current Tsukasa service. [Tsukasa]"))
+    return choices
+
+
+def qwen_voice_choices() -> list[str]:
+    return list(QWEN_VOICE_CHOICES.values())
+
 
 def _read_text_file(path: Path, fallback: str = "") -> str:
     if path.is_file():
@@ -75,6 +131,7 @@ class RuntimeSettings:
     active_character_prompt: str
     active_instructions: str
     active_voice: str
+    active_qwen_voice: str
     active_tts_instructions: str
     gui_tool_names: list[str]
 
@@ -82,7 +139,7 @@ class RuntimeSettings:
         self._lock = threading.Lock()
         self._version = 0
 
-    def snapshot(self) -> tuple[str, list[str], str, str, str, str, int]:
+    def snapshot(self) -> tuple[str, list[str], str, str, str, str, str, int]:
         with self._lock:
             return (
                 self.active_profile,
@@ -90,6 +147,7 @@ class RuntimeSettings:
                 self.active_character_prompt,
                 self.active_instructions,
                 self.active_voice,
+                self.active_qwen_voice,
                 self.active_tts_instructions,
                 self._version,
             )
@@ -101,8 +159,9 @@ class RuntimeSettings:
         character_prompt: str,
         instructions: str,
         voice: str,
+        qwen_voice: str,
         tts_instructions: str,
-    ) -> tuple[str, list[str], str, str, str, str, int]:
+    ) -> tuple[str, list[str], str, str, str, str, str, int]:
         normalized = [tool for tool in self.gui_tool_names if tool in enabled_tools]
         with self._lock:
             self.active_profile = profile
@@ -110,6 +169,7 @@ class RuntimeSettings:
             self.active_character_prompt = character_prompt.strip()
             self.active_instructions = instructions.strip()
             self.active_voice = voice
+            self.active_qwen_voice = _canonical_qwen_voice(qwen_voice) or DEFAULT_QWEN_VOICE
             self.active_tts_instructions = tts_instructions.strip()
             self._version += 1
             return (
@@ -118,6 +178,7 @@ class RuntimeSettings:
                 self.active_character_prompt,
                 self.active_instructions,
                 self.active_voice,
+                self.active_qwen_voice,
                 self.active_tts_instructions,
                 self._version,
             )
@@ -299,7 +360,7 @@ def _load_profile_voice_config(profile_dir: Path) -> dict[str, str]:
 def load_profile_voice_by_name(profiles_dir: Path, profile: str, fallback: str = DEFAULT_VOICE) -> str:
     profile_dir = profiles_dir / profile
     voice = _load_profile_voice_config(profile_dir).get("voice", "").strip() or fallback
-    if any(voice == name for name, _description in VOICE_CHOICES):
+    if voice:
         return voice
     return fallback
 
@@ -321,7 +382,7 @@ def load_profile_qwen_voice_by_name(profiles_dir: Path, profile: str, fallback: 
 
 
 def build_tts_request_voice(voice: str, qwen_voice: str) -> str | dict[str, str]:
-    primary_voice = voice.strip()
+    primary_voice = normalize_tsukasa_voice(voice)
     normalized_qwen_voice = _canonical_qwen_voice(qwen_voice)
     if primary_voice and normalized_qwen_voice:
         return {
@@ -339,6 +400,7 @@ def save_profile_definition(
     character_prompt: str,
     selected_tools: list[str],
     voice: str,
+    qwen_voice: str | None,
     tts_instructions: str,
     gui_tool_names: list[str],
 ) -> Path:
@@ -348,12 +410,12 @@ def save_profile_definition(
     (profile_dir / "character.txt").write_text(character_prompt.strip() + "\n", encoding="utf-8")
     ordered_tools = [tool for tool in gui_tool_names if tool in selected_tools]
     (profile_dir / "tools.txt").write_text("\n".join(ordered_tools) + "\n", encoding="utf-8")
-    qwen_voice = _canonical_qwen_voice(voice) or existing_qwen_voice or DEFAULT_QWEN_VOICE
+    normalized_qwen_voice = _canonical_qwen_voice(qwen_voice or "") or _canonical_qwen_voice(voice) or existing_qwen_voice or DEFAULT_QWEN_VOICE
     _profile_voice_config_path(profile_dir).write_text(
         json.dumps(
             {
                 "voice": voice.strip(),
-                "qwen_voice": qwen_voice,
+                "qwen_voice": normalized_qwen_voice,
                 "tts_instructions": tts_instructions.strip(),
             },
             ensure_ascii=False,

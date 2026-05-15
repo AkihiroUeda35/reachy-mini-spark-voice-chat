@@ -76,9 +76,10 @@ def save_profile_definition(
     character_prompt: str,
     selected_tools: list[str],
     voice: str,
+    qwen_voice: str | None,
     tts_instructions: str,
 ) -> Path:
-    return _save_profile_definition(profiles_dir, profile, character_prompt, selected_tools, voice, tts_instructions, GUI_TOOL_NAMES)
+    return _save_profile_definition(profiles_dir, profile, character_prompt, selected_tools, voice, qwen_voice, tts_instructions, GUI_TOOL_NAMES)
 
 
 def load_profile_prompt(args: argparse.Namespace) -> str:
@@ -238,6 +239,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--tts-base-url", default=TTS_BASE_URL, help="OpenAI-compatible TTS base URL.")
     parser.add_argument("--tts-api-key", default=TTS_API_KEY, help="Bearer token for the TTS endpoint.")
+    parser.add_argument("--tts-backend", default=None, help="Optional TTS backend override. Leave unset to use the TTS wrapper backend from its environment.")
     parser.add_argument("--tts-model", default=TTS_MODEL, help="TTS model name.")
     parser.add_argument("--tts-task-type", default=TTS_TASK_TYPE, help="TTS task type.")
     parser.add_argument("--tts-language", default=TTS_LANGUAGE, help="TTS language.")
@@ -502,6 +504,10 @@ async def _run_async_cleanup_step(logger: logging.Logger, name: str, awaitable: 
         logger.exception("Cleanup step failed: %s", name)
 
 
+def _settings_changed_during_turn(runtime_settings: RuntimeSettings, expected_version: int) -> bool:
+    return runtime_settings.snapshot()[-1] != expected_version
+
+
 async def conversation_loop(args: argparse.Namespace) -> int:
     app_logger = logging.getLogger("conversation.app")
     asr_logger = logging.getLogger("conversation.asr")
@@ -524,6 +530,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
         active_character_prompt=load_profile_character_prompt_by_name(profiles_dir, args.profile, DEFAULT_CHARACTER_PROMPT),
         active_instructions=load_profile_prompt_by_name(profiles_dir, args.profile, DEFAULT_CHARACTER_PROMPT),
         active_voice=primary_voice,
+        active_qwen_voice=load_profile_qwen_voice_by_name(profiles_dir, args.profile),
         active_tts_instructions=load_profile_tts_instructions_by_name(profiles_dir, args.profile, args.tts_instructions or DEFAULT_TTS_INSTRUCTIONS),
         gui_tool_names=GUI_TOOL_NAMES,
     )
@@ -589,7 +596,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
         )
 
         while not stop_event.is_set():
-            active_profile, active_tools, _active_character_prompt, active_instructions, active_voice, active_tts_instructions, settings_version = runtime_settings.snapshot()
+            active_profile, active_tools, _active_character_prompt, active_instructions, active_voice, active_qwen_voice, active_tts_instructions, settings_version = runtime_settings.snapshot()
             if settings_version != last_settings_version:
                 history.clear()
                 last_settings_version = settings_version
@@ -598,7 +605,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
             args.system_prompt = active_instructions
             args.voice = build_tts_request_voice(
                 active_voice,
-                load_profile_qwen_voice_by_name(profiles_dir, active_profile),
+                active_qwen_voice,
             )
             args.tts_instructions = active_tts_instructions
             next_persona_signature = (active_profile, active_instructions)
@@ -614,8 +621,14 @@ async def conversation_loop(args: argparse.Namespace) -> int:
             captured_utterance = await capture_robot_utterance(robot, args, assistant_speech_state=assistant_speech_state)
             if captured_utterance is None or stop_event.is_set():
                 continue
+            if _settings_changed_during_turn(runtime_settings, settings_version):
+                app_logger.info("[bold]Discarding pending utterance because live settings changed[/]")
+                continue
 
             payload = await transcribe_captured_audio(args, captured_utterance)
+            if _settings_changed_during_turn(runtime_settings, settings_version):
+                app_logger.info("[bold]Discarding transcript because live settings changed[/]")
+                continue
             transcript_text = payload if isinstance(payload, str) else str(payload.get("text", "")).strip()
             if not transcript_text:
                 asr_logger.warning("[bold blue]ASR[/] empty transcript, skipping turn")
@@ -673,8 +686,6 @@ async def conversation_loop(args: argparse.Namespace) -> int:
             await _run_blocking_cleanup_step(app_logger, "gradio.close", gradio_handle.close)
         await _run_blocking_cleanup_step(app_logger, "media.stop_recording", robot.media.stop_recording)
         await _run_blocking_cleanup_step(app_logger, "media.stop_playing", robot.media.stop_playing)
-        if args.wake_up and not interrupted:
-            await _run_blocking_cleanup_step(app_logger, "goto_sleep", robot.goto_sleep, timeout_s=3.0)
         await _run_blocking_cleanup_step(app_logger, "media_manager.close", robot.media_manager.close)
         await _run_blocking_cleanup_step(app_logger, "client.disconnect", robot.client.disconnect)
     return 0

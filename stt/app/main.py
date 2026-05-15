@@ -187,7 +187,13 @@ def _fish_chunk_bytes() -> int:
 
 
 def _tts_backend() -> str:
-    backend = _env("TTS_BACKEND", "qwen3-tts").strip().lower()
+    return _normalize_tts_backend_name(_env("TTS_BACKEND", "qwen3-tts")) or "qwen3-tts"
+
+
+def _normalize_tts_backend_name(backend: str | None) -> str | None:
+    normalized = (backend or "").strip().lower()
+    if not normalized:
+        return None
     aliases = {
         "qwen": "qwen3-tts",
         "qwen3": "qwen3-tts",
@@ -201,7 +207,7 @@ def _tts_backend() -> str:
         "tsukasa_speech": "tsukasa-speech",
         "respair-tsukasa": "tsukasa-speech",
     }
-    return aliases.get(backend, backend)
+    return aliases.get(normalized, normalized)
 
 
 def _contains_japanese(text: str) -> bool:
@@ -238,7 +244,7 @@ def _apply_detected_tts_language(session: "RealtimeSession", detected_language: 
 
 
 def _tts_backend_for_request(req: "SpeechRequest") -> str:
-    backend = _tts_backend()
+    backend = _normalize_tts_backend_name(req.backend) or _tts_backend()
     if backend != "tsukasa-speech":
         return backend
 
@@ -878,6 +884,7 @@ def _extract_text_from_response(message: dict[str, Any], fallback: str) -> str:
 class SpeechRequest(BaseModel):
     model: str = Field(default_factory=_tts_public_model_name)
     input: str = Field(..., min_length=1)
+    backend: str = ""
     voice: str | dict[str, str] = Field(default_factory=lambda: _env("TTS_DEFAULT_VOICE", _env("QWEN_TTS_DEFAULT_VOICE", "Ono_Anna")))
     instructions: str = ""
     response_format: str = "wav"
@@ -895,6 +902,7 @@ class SpeechRequest(BaseModel):
 
 class RealtimeSession(BaseModel):
     model: str = Field(default_factory=_tts_public_model_name)
+    backend: str = ""
     voice: str | dict[str, str] = Field(default_factory=lambda: _env("TTS_DEFAULT_VOICE", _env("QWEN_TTS_DEFAULT_VOICE", "Ono_Anna")))
     instructions: str = ""
     input_text: str = ""
@@ -1305,6 +1313,8 @@ async def realtime_socket(websocket: WebSocket):
                 payload = message.get("session") or {}
                 if isinstance(payload.get("model"), str) and payload["model"].strip():
                     session.model = payload["model"].strip()
+                if isinstance(payload.get("backend"), str):
+                    session.backend = _normalize_tts_backend_name(payload["backend"]) or ""
                 if isinstance(payload.get("voice"), str) and payload["voice"].strip():
                     session.voice = payload["voice"].strip()
                 elif isinstance(payload.get("voice"), dict):
@@ -1628,6 +1638,7 @@ async def realtime_socket(websocket: WebSocket):
                 speech_req = SpeechRequest(
                     model=session.model,
                     input=text,
+                    backend=session.backend,
                     voice=session.voice,
                     instructions=session.instructions,
                     response_format="pcm",

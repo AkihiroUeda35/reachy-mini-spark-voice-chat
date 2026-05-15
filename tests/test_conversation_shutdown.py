@@ -176,6 +176,42 @@ class ConversationShutdownTests(unittest.TestCase):
         self.assertEqual(speak_greeting.await_args_list[0].kwargs["reason"], "startup")
         self.assertEqual(speak_greeting.await_args_list[1].kwargs["reason"], "persona switch")
 
+    def test_conversation_loop_discards_pending_turn_when_live_settings_change_during_capture(self) -> None:
+        args = self._make_args(wake_up=False)
+        robot = self._make_robot()
+        runtime = MagicMock()
+        runtime.shutdown = AsyncMock()
+        speak_greeting = AsyncMock(side_effect=[
+            [{"role": "assistant", "content": "こんにちは。"}],
+            [{"role": "assistant", "content": "拙者が参った。"}],
+        ])
+        runtime_settings = MagicMock()
+        runtime_settings.snapshot.side_effect = [
+            ("default", [], "Be helpful.", "You are helpful.", "Sohee", "Be concise.", 0),
+            ("samurai", [], "Be stoic.", "You are stoic.", "Sohee", "Be concise.", 1),
+            ("samurai", [], "Be stoic.", "You are stoic.", "Sohee", "Be concise.", 1),
+        ]
+        transcribe_audio = AsyncMock()
+        run_turn = AsyncMock()
+
+        with (
+            patch("main.resolve_runtime_models"),
+            patch("main.ReachyMini", return_value=robot),
+            patch("main.RuntimeSettings", return_value=runtime_settings),
+            patch("main.reachy_tools.ReachyToolRuntime", return_value=runtime),
+            patch("main._speak_persona_greeting", speak_greeting),
+            patch("main.capture_robot_utterance", side_effect=[MagicMock(), KeyboardInterrupt]),
+            patch("main.transcribe_captured_audio", transcribe_audio),
+            patch("main.run_pipeline", run_turn),
+        ):
+            result = asyncio.run(conversation_loop(args))
+
+        self.assertEqual(result, 0)
+        transcribe_audio.assert_not_awaited()
+        run_turn.assert_not_awaited()
+        self.assertEqual(speak_greeting.await_count, 2)
+        self.assertEqual(speak_greeting.await_args_list[1].kwargs["reason"], "persona switch")
+
 
 if __name__ == "__main__":
     unittest.main()
