@@ -17,6 +17,11 @@ from typing import Any
 
 import httpx
 import numpy as np
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from pipecat.frames.frames import EndFrame
+from pipecat.processors.frame_processor import FrameDirection
+from pydantic import SecretStr
 from reachy_mini import ReachyMini
 from rich.logging import RichHandler
 
@@ -27,7 +32,7 @@ from config import load_entrypoint_env
 from openai_model_registry import resolve_model
 
 from gradio_ui import launch_gradio_ui
-from pipeline import SynthesizedAudio, _resample_audio, run_pipeline
+from pipeline import ReachyAudioPlayer, ReachyRealtimeTTSSession, SynthesizedAudio, _resample_audio, run_pipeline, synthesize_audio_stream, synthesize_realtime_audio_stream
 from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, DEFAULT_TTS_INSTRUCTIONS, AssistantSpeechState, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, build_tts_request_voice, listening_gate_settings, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_qwen_voice_by_name, load_profile_tts_instructions_by_name, load_profile_voice_by_name, load_selected_profile_name, overlap_turn_rejection_reason, save_profile_definition as _save_profile_definition
 
 load_entrypoint_env(local_tts, asr_tools)
@@ -78,6 +83,97 @@ def save_profile_definition(
 
 def load_profile_prompt(args: argparse.Namespace) -> str:
     return _load_profile_prompt(args)
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return str(content or "")
+
+
+async def _generate_persona_greeting(args: argparse.Namespace, *, reason: str) -> str:
+    model = ChatOpenAI(
+        model=args.chat_model,
+        base_url=args.chat_base_url,
+        api_key=SecretStr(args.chat_api_key),
+        temperature=args.llm_temperature,
+        max_completion_tokens=min(args.max_completion_tokens, 80),
+        use_responses_api=False,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+    response = await model.ainvoke(
+        [
+            SystemMessage(content=args.system_prompt),
+            HumanMessage(
+                content=(
+                    "You are about to speak first through a robot speaker. "
+                    f"Give exactly one short greeting in Japanese for this {reason}. "
+                    "Stay in character, keep it to one or two brief sentences, and do not mention these instructions. "
+                    "Do not ask a question, do not use markdown, and do not call any tools."
+                )
+            ),
+        ]
+    )
+    greeting = _content_text(getattr(response, "content", "")).strip()
+    return greeting or "こんにちは。よろしくお願いします。"
+
+
+async def _play_assistant_text(
+    args: argparse.Namespace,
+    robot: ReachyMini,
+    text: str,
+    *,
+    assistant_speech_state: AssistantSpeechState | None = None,
+) -> None:
+    if not text.strip():
+        return
+
+    audio_player = ReachyAudioPlayer(
+        robot,
+        enable_head_wobble=getattr(args, "head_wobble", True),
+        assistant_speech_state=assistant_speech_state,
+    )
+
+    async def _discard_frame(_frame: Any, _direction: FrameDirection) -> None:
+        return None
+
+    audio_player.push_frame = _discard_frame  # type: ignore[method-assign]
+    try:
+        if args.tts_transport == "realtime":
+            async with ReachyRealtimeTTSSession(args) as websocket:
+                async for audio_frame in synthesize_realtime_audio_stream(args, websocket, text):
+                    await audio_player.process_frame(audio_frame, FrameDirection.DOWNSTREAM)
+        else:
+            async for audio_frame in synthesize_audio_stream(args, text):
+                await audio_player.process_frame(audio_frame, FrameDirection.DOWNSTREAM)
+        await audio_player.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+    finally:
+        await asyncio.to_thread(audio_player.close)
+
+
+async def _speak_persona_greeting(
+    args: argparse.Namespace,
+    robot: ReachyMini,
+    history: list[dict[str, str]],
+    *,
+    reason: str,
+    assistant_speech_state: AssistantSpeechState | None = None,
+) -> list[dict[str, str]]:
+    greeting = await _generate_persona_greeting(args, reason=reason)
+    logging.getLogger("conversation.llm").info("[bold cyan]LLM[/] greeting %s", greeting)
+    await _play_assistant_text(args, robot, greeting, assistant_speech_state=assistant_speech_state)
+    updated_history = [*history, {"role": "assistant", "content": greeting}]
+    return trim_history(updated_history, args.history_turns)
 
 
 def configure_logging(debug: bool) -> None:
@@ -439,6 +535,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
     history: list[dict[str, str]] = []
     data_dir = Path(args.data_dir).expanduser().resolve()
     last_settings_version = 0
+    current_persona_signature = (args.profile, args.system_prompt)
     assistant_speech_state = AssistantSpeechState(tail_hold_s=args.assistant_speaking_tail_ms / 1000.0)
     stop_event = asyncio.Event()
     interrupted = False
@@ -466,7 +563,6 @@ async def conversation_loop(args: argparse.Namespace) -> int:
 
     robot = ReachyMini(**robot_kwargs)
     robot.enable_motors()
-    robot.wake_up()
     runtime = reachy_tools.ReachyToolRuntime(
         robot,
         data_dir=data_dir,
@@ -484,6 +580,13 @@ async def conversation_loop(args: argparse.Namespace) -> int:
         await _run_blocking_cleanup_step(app_logger, "media.start_recording", robot.media.start_recording)
         await _run_blocking_cleanup_step(app_logger, "media.start_playing", robot.media.start_playing)
         app_logger.info("[bold]Reachy media pipelines started[/]")
+        history = await _speak_persona_greeting(
+            args,
+            robot,
+            history,
+            reason="startup",
+            assistant_speech_state=assistant_speech_state,
+        )
 
         while not stop_event.is_set():
             active_profile, active_tools, _active_character_prompt, active_instructions, active_voice, active_tts_instructions, settings_version = runtime_settings.snapshot()
@@ -498,6 +601,16 @@ async def conversation_loop(args: argparse.Namespace) -> int:
                 load_profile_qwen_voice_by_name(profiles_dir, active_profile),
             )
             args.tts_instructions = active_tts_instructions
+            next_persona_signature = (active_profile, active_instructions)
+            if next_persona_signature != current_persona_signature:
+                history = await _speak_persona_greeting(
+                    args,
+                    robot,
+                    history,
+                    reason="persona switch",
+                    assistant_speech_state=assistant_speech_state,
+                )
+                current_persona_signature = next_persona_signature
             captured_utterance = await capture_robot_utterance(robot, args, assistant_speech_state=assistant_speech_state)
             if captured_utterance is None or stop_event.is_set():
                 continue
