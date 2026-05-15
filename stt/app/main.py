@@ -5,6 +5,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import struct
 import tempfile
 import threading
@@ -21,7 +22,7 @@ from faster_whisper import WhisperModel
 from pydantic import BaseModel, Field
 
 
-app = FastAPI(title="OpenAI-compatible Qwen3-TTS + Faster Whisper Server")
+app = FastAPI(title="OpenAI-compatible TTS + Faster Whisper Server")
 
 _stt_model: WhisperModel | None = None
 _stt_lock = threading.Lock()
@@ -30,6 +31,18 @@ _tts_warmup_task: asyncio.Task[None] | None = None
 
 logger = logging.getLogger("tts")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+QWEN_SUPPORTED_VOICES = {
+    "aiden",
+    "dylan",
+    "eric",
+    "ono_anna",
+    "ryan",
+    "serena",
+    "sohee",
+    "uncle_fu",
+    "vivian",
+}
 
 _tts_warmup_started = False
 _stt_warmup_started = False
@@ -173,16 +186,174 @@ def _fish_chunk_bytes() -> int:
     return int(_env("COSY_TTS_STREAM_CHUNK_BYTES", _env("FISH_TTS_STREAM_CHUNK_BYTES", "8192")))
 
 
-def _tts_upstream_base_url() -> str:
-    return _env("TTS_UPSTREAM_BASE_URL", _env("QWEN_TTS_BASE_URL", "http://qwen3-tts:8091")).rstrip("/")
+def _tts_backend() -> str:
+    backend = _env("TTS_BACKEND", "qwen3-tts").strip().lower()
+    aliases = {
+        "qwen": "qwen3-tts",
+        "qwen3": "qwen3-tts",
+        "qwen3-tts": "qwen3-tts",
+        "cosy": "cosyvoice",
+        "cosyvoice": "cosyvoice",
+        "fish": "cosyvoice",
+        "fish-speech": "cosyvoice",
+        "tsukasa": "tsukasa-speech",
+        "tsukasa-speech": "tsukasa-speech",
+        "tsukasa_speech": "tsukasa-speech",
+        "respair-tsukasa": "tsukasa-speech",
+    }
+    return aliases.get(backend, backend)
 
 
-def _tts_upstream_model_name() -> str:
-    return _env("TTS_UPSTREAM_MODEL", _env("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"))
+def _contains_japanese(text: str) -> bool:
+    return bool(re.search(r"[ぁ-んァ-ン一-龯]", text))
+
+
+def _looks_english_text(text: str) -> bool:
+    latin_chars = re.findall(r"[A-Za-z]", text)
+    if len(latin_chars) < 3:
+        return False
+    if _contains_japanese(text):
+        return False
+    return True
+
+
+def _tts_language_from_transcription_language(language: str | None) -> str | None:
+    normalized = (language or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized.startswith("en"):
+        return "English"
+    if normalized.startswith("ja"):
+        return "Japanese"
+    return None
+
+
+def _apply_detected_tts_language(session: "RealtimeSession", detected_language: str | None) -> None:
+    mapped_language = _tts_language_from_transcription_language(detected_language)
+    if not mapped_language:
+        return
+    if session.language != mapped_language:
+        logger.info("Updating realtime TTS language from transcription: %s -> %s", session.language, mapped_language)
+        session.language = mapped_language
+
+
+def _tts_backend_for_request(req: "SpeechRequest") -> str:
+    backend = _tts_backend()
+    if backend != "tsukasa-speech":
+        return backend
+
+    language = req.language.strip().lower()
+    if language in {"english", "en", "en-us", "en-gb"} or _looks_english_text(req.input):
+        logger.info("Routing English TTS request to qwen3-tts instead of tsukasa-speech")
+        return "qwen3-tts"
+    return backend
+
+
+def _qwen_default_voice() -> str:
+    raw = _env("QWEN_TTS_DEFAULT_VOICE", "ono_anna").strip()
+    lowered = raw.lower()
+    if lowered in QWEN_SUPPORTED_VOICES:
+        return lowered
+    return "ono_anna"
+
+
+def _default_voice_for_backend(backend: str) -> str:
+    if backend == "tsukasa-speech":
+        return _tsukasa_default_voice()
+    if backend == "qwen3-tts":
+        return _qwen_default_voice()
+    return _env("TTS_DEFAULT_VOICE", _env("QWEN_TTS_DEFAULT_VOICE", "ono_anna"))
+
+
+def _normalize_voice_for_backend(voice: str | dict[str, str], backend: str) -> str | dict[str, str]:
+    if isinstance(voice, dict):
+        return voice
+
+    normalized = voice.strip()
+    if backend != "qwen3-tts":
+        return normalized
+
+    lowered = normalized.lower()
+    if lowered in QWEN_SUPPORTED_VOICES:
+        return lowered
+    return _qwen_default_voice()
+
+
+def _tsukasa_base_url() -> str:
+    return _env("TSUKASA_SPEECH_BASE_URL", "http://tsukasa-speech:5001").rstrip("/")
+
+
+def _tsukasa_model_name() -> str:
+    return _env("TSUKASA_SPEECH_MODEL", "Respair/Tsukasa_Speech")
+
+
+def _tsukasa_public_model_name() -> str:
+    return _env("TSUKASA_SPEECH_PUBLIC_MODEL_NAME", _tsukasa_model_name())
+
+
+def _tsukasa_timeout() -> float:
+    return float(_env("TSUKASA_SPEECH_TIMEOUT", _env("TTS_UPSTREAM_TIMEOUT", "600")))
+
+
+def _tsukasa_chunk_bytes() -> int:
+    return int(_env("TSUKASA_SPEECH_STREAM_CHUNK_BYTES", _env("TTS_UPSTREAM_STREAM_CHUNK_BYTES", "8192")))
+
+
+def _tsukasa_sample_rate() -> int:
+    return _env_int("TSUKASA_SPEECH_SAMPLE_RATE", 24000)
+
+
+def _tsukasa_default_voice() -> str:
+    return _env("TSUKASA_SPEECH_DEFAULT_VOICE", "audio_ref")
+
+
+def _tsukasa_default_diffusion_steps() -> int:
+    return _env_int("TSUKASA_SPEECH_DEFAULT_DIFFUSION_STEPS", 5)
+
+
+def _tsukasa_default_embedding_scale() -> float:
+    return float(_env("TSUKASA_SPEECH_DEFAULT_EMBEDDING_SCALE", "1.0"))
+
+
+def _tsukasa_default_alpha() -> float:
+    return float(_env("TSUKASA_SPEECH_DEFAULT_ALPHA", "0.3"))
+
+
+def _tsukasa_default_beta() -> float:
+    return float(_env("TSUKASA_SPEECH_DEFAULT_BETA", "0.7"))
+
+
+def _tts_upstream_base_url(backend: str | None = None) -> str:
+    explicit = os.environ.get("TTS_UPSTREAM_BASE_URL", "").strip()
+    if explicit and (backend is None or backend == _tts_backend()):
+        return explicit.rstrip("/")
+    backend = backend or _tts_backend()
+    if backend == "tsukasa-speech":
+        return _tsukasa_base_url()
+    if backend == "cosyvoice":
+        return _fish_base_url()
+    return _env("QWEN_TTS_BASE_URL", "http://qwen3-tts:8091").rstrip("/")
+
+
+def _tts_upstream_model_name(backend: str | None = None) -> str:
+    explicit = os.environ.get("TTS_UPSTREAM_MODEL", "").strip()
+    if explicit and (backend is None or backend == _tts_backend()):
+        return explicit
+    backend = backend or _tts_backend()
+    if backend == "tsukasa-speech":
+        return _tsukasa_model_name()
+    if backend == "cosyvoice":
+        return _fish_model_name()
+    return _env("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
 
 
 def _tts_public_model_name() -> str:
-    return _env("TTS_PUBLIC_MODEL_NAME", _tts_upstream_model_name())
+    explicit = os.environ.get("TTS_PUBLIC_MODEL_NAME", "").strip()
+    if explicit:
+        return explicit
+    if _tts_backend() == "tsukasa-speech":
+        return _tsukasa_public_model_name()
+    return _tts_upstream_model_name()
 
 
 def _dedupe_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -197,14 +368,28 @@ def _dedupe_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return deduped
 
 
-def _resolve_tts_request_model(model_name: str | None) -> str:
+def _resolve_tts_request_model(model_name: str | None, backend: str | None = None) -> str:
     normalized = (model_name or "").strip()
-    if not normalized or normalized in {"tts-1", _tts_public_model_name()}:
-        return _tts_upstream_model_name()
+    target_backend = backend or _tts_backend()
+    aliases = {
+        "tts-1",
+        _tts_public_model_name(),
+        _tts_upstream_model_name(),
+        _tsukasa_public_model_name(),
+        _tsukasa_model_name(),
+        _env("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
+    }
+    if not normalized or normalized in aliases:
+        return _tts_upstream_model_name(target_backend)
     return normalized
 
 
-def _tts_upstream_timeout() -> float:
+def _tts_upstream_timeout(backend: str | None = None) -> float:
+    backend = backend or _tts_backend()
+    if backend == "tsukasa-speech":
+        return _tsukasa_timeout()
+    if backend == "cosyvoice":
+        return _fish_timeout()
     return float(_env("TTS_UPSTREAM_TIMEOUT", _env("QWEN_TTS_TIMEOUT", _env("COSY_TTS_TIMEOUT", "600"))))
 
 
@@ -212,7 +397,9 @@ def _tts_upstream_api_key() -> str:
     return _env("TTS_UPSTREAM_API_KEY", _env("QWEN_TTS_API_KEY", "EMPTY"))
 
 
-def _tts_upstream_headers() -> dict[str, str]:
+def _tts_upstream_headers(backend: str | None = None) -> dict[str, str]:
+    if (backend or _tts_backend()) == "tsukasa-speech":
+        return {}
     api_key = _tts_upstream_api_key()
     if not api_key:
         return {}
@@ -505,6 +692,137 @@ async def _pcm_stream_from_audio(audio: np.ndarray, chunk_size: int) -> AsyncGen
         yield _to_pcm16(audio[start : start + step])
 
 
+def _resample_audio(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    if source_rate == target_rate:
+        return audio.astype(np.float32, copy=False)
+    if audio.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    target_length = max(1, int(round(audio.shape[0] * target_rate / source_rate)))
+    source_positions = np.linspace(0.0, 1.0, num=audio.shape[0], endpoint=False)
+    target_positions = np.linspace(0.0, 1.0, num=target_length, endpoint=False)
+    return np.interp(target_positions, source_positions, audio).astype(np.float32)
+
+
+def _tsukasa_voice_settings(req: "SpeechRequest") -> dict[str, Any]:
+    voice_cfg = _voice_config(_voice_name(req.voice))
+    requested_voice = req.voice if isinstance(req.voice, str) else ""
+    ref_audio = str(
+        voice_cfg.get("voice_ref")
+        or voice_cfg.get("reference_wav")
+        or voice_cfg.get("reference_audio")
+        or voice_cfg.get("ref_audio")
+        or ""
+    ).strip()
+    voice_name = str(
+        voice_cfg.get("voice")
+        or voice_cfg.get("speaker")
+        or voice_cfg.get("speaker_name")
+        or requested_voice
+        or _tsukasa_default_voice()
+    ).strip()
+    if not voice_name and ref_audio:
+        voice_name = Path(ref_audio).stem
+    return {
+        "voice": voice_name or _tsukasa_default_voice(),
+        "diffusion_steps": int(voice_cfg.get("diffusion_steps", _tsukasa_default_diffusion_steps())),
+        "embedding_scale": float(voice_cfg.get("embedding_scale", _tsukasa_default_embedding_scale())),
+        "alpha": float(voice_cfg.get("alpha", _tsukasa_default_alpha())),
+        "beta": float(voice_cfg.get("beta", _tsukasa_default_beta())),
+    }
+
+
+def _tsukasa_payload(req: "SpeechRequest") -> dict[str, Any]:
+    settings = _tsukasa_voice_settings(req)
+    speed = req.speed if req.speed > 0 else 1.0
+    payload = {
+        "text": req.input,
+        "voice": settings["voice"],
+        "speed": speed,
+        "diffusion_steps": settings["diffusion_steps"],
+        "embedding_scale": settings["embedding_scale"],
+        "alpha": settings["alpha"],
+        "beta": settings["beta"],
+        "language": req.language,
+    }
+    if req.instructions.strip():
+        payload["instructions"] = req.instructions.strip()
+    return payload
+
+
+async def _tsukasa_health() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{_tsukasa_base_url()}/health")
+            return response.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+async def _tsukasa_complete_audio(req: "SpeechRequest", fmt: str) -> bytes:
+    payload = _tsukasa_payload(req)
+    try:
+        async with httpx.AsyncClient(timeout=_tsukasa_timeout()) as client:
+            response = await client.post(f"{_tsukasa_base_url()}/synthesize", json=payload)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"Tsukasa Speech upstream error: {exc.response.text}") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Tsukasa Speech upstream unreachable: {exc}") from exc
+
+    source_audio, sample_rate = sf.read(io.BytesIO(response.content), dtype="float32")
+    if isinstance(source_audio, np.ndarray) and source_audio.ndim > 1:
+        source_audio = source_audio.mean(axis=1)
+    audio = np.asarray(source_audio, dtype=np.float32)
+
+    target_rate = _tsukasa_sample_rate()
+    if sample_rate != target_rate:
+        audio = _resample_audio(audio, int(sample_rate), target_rate)
+        sample_rate = target_rate
+
+    return _encode_audio(audio, int(sample_rate), fmt)
+
+
+async def _tsukasa_stream_audio(req: "SpeechRequest") -> AsyncGenerator[bytes, None]:
+    wav_bytes = await _tsukasa_complete_audio(req, "wav")
+    audio, sample_rate = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    if isinstance(audio, np.ndarray) and audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    mono = np.asarray(audio, dtype=np.float32)
+    target_rate = _tsukasa_sample_rate()
+    if sample_rate != target_rate:
+        mono = _resample_audio(mono, int(sample_rate), target_rate)
+    chunk_size = req.chunk_size or _tsukasa_chunk_bytes() // 2
+    async for chunk in _pcm_stream_from_audio(mono, chunk_size):
+        yield chunk
+
+
+def _encode_audio(audio: np.ndarray, sample_rate: int, fmt: str) -> bytes:
+    if fmt == "pcm":
+        return _to_pcm16(audio)
+    if fmt == "wav":
+        return _complete_wav(audio, sample_rate)
+    if fmt == "mp3":
+        return _mp3_bytes(audio, sample_rate)
+
+    buffer = io.BytesIO()
+    subtype = None
+    format_name = fmt.upper()
+    if fmt == "flac":
+        format_name = "FLAC"
+    elif fmt == "opus":
+        format_name = "OGG"
+        subtype = "OPUS"
+    elif fmt == "aac":
+        from pydub import AudioSegment
+
+        segment = AudioSegment(_to_pcm16(audio), frame_rate=sample_rate, sample_width=2, channels=1)
+        segment.export(buffer, format="adts")
+        return buffer.getvalue()
+
+    sf.write(buffer, audio, sample_rate, format=format_name, subtype=subtype)
+    return buffer.getvalue()
+
+
 def _realtime_event_id() -> str:
     return f"event_{uuid.uuid4().hex}"
 
@@ -587,14 +905,16 @@ def _tts_request_payload(
     *,
     response_format: str | None = None,
     stream: bool | None = None,
+    backend: str | None = None,
 ) -> dict[str, Any]:
     use_stream = req.stream if stream is None else stream
+    target_backend = backend or _tts_backend_for_request(req)
     payload: dict[str, Any] = {
         "input": req.input,
         "response_format": response_format or req.response_format.lower(),
     }
 
-    payload["model"] = _resolve_tts_request_model(req.model)
+    payload["model"] = _resolve_tts_request_model(req.model, target_backend)
 
     if use_stream:
         payload["stream"] = True
@@ -610,7 +930,7 @@ def _tts_request_payload(
     if req.max_new_tokens is not None:
         payload["max_new_tokens"] = req.max_new_tokens
 
-    voice_name = _voice_name(req.voice)
+    voice_name = _voice_name(_normalize_voice_for_backend(req.voice, target_backend))
     if req.task_type != "VoiceDesign" and voice_name:
         payload["voice"] = voice_name
 
@@ -633,6 +953,11 @@ def _tts_request_payload(
 
 
 async def _tts_health() -> bool:
+    backend = _tts_backend()
+    if backend == "tsukasa-speech":
+        return await _tsukasa_health()
+    if backend == "cosyvoice":
+        return await _fish_health()
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{_tts_upstream_base_url()}/health", headers=_tts_upstream_headers())
@@ -670,57 +995,74 @@ async def _warmup_tts_upstream() -> None:
         logger.warning("TTS upstream warmup skipped because upstream health never became ready")
         return
 
-    payload = {
-        "model": _tts_upstream_model_name(),
-        "input": _tts_warmup_text(),
-        "voice": _env("TTS_DEFAULT_VOICE", _env("QWEN_TTS_DEFAULT_VOICE", "Ono_Anna")),
-        "task_type": _default_task_type(),
-        "language": _env("TTS_DEFAULT_LANGUAGE", _env("QWEN_TTS_DEFAULT_LANGUAGE", "Japanese")),
-        "response_format": "wav",
-        "stream": False,
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=_tts_upstream_timeout()) as client:
-            response = await client.post(
-                f"{_tts_upstream_base_url()}/v1/audio/speech",
-                json=payload,
-                headers=_tts_upstream_headers(),
-            )
-            response.raise_for_status()
+        backend = _tts_backend()
+        await _tts_complete_audio(
+            SpeechRequest(
+                model=_tts_public_model_name(),
+                input=_tts_warmup_text(),
+                voice=_default_voice_for_backend(backend),
+                task_type=_default_task_type(),
+                language=_env("TTS_DEFAULT_LANGUAGE", _env("QWEN_TTS_DEFAULT_LANGUAGE", "Japanese")),
+                response_format="wav",
+                stream=False,
+            ),
+            response_format="wav",
+        )
         logger.info("TTS upstream warmup completed")
-    except httpx.HTTPError as exc:
+    except HTTPException as exc:
         logger.warning("TTS upstream warmup failed: %s", exc)
 
 
-async def _tts_request_with_failover(method: str, path: str, **kwargs: Any) -> httpx.Response:
-    headers = {**_tts_upstream_headers(), **(kwargs.pop("headers", {}) or {})}
+async def _tts_request_with_failover(method: str, path: str, *, backend: str | None = None, **kwargs: Any) -> httpx.Response:
+    headers = {**_tts_upstream_headers(backend), **(kwargs.pop("headers", {}) or {})}
     try:
-        async with httpx.AsyncClient(timeout=_tts_upstream_timeout()) as client:
-            response = await client.request(method, f"{_tts_upstream_base_url()}{path}", headers=headers, **kwargs)
+        async with httpx.AsyncClient(timeout=_tts_upstream_timeout(backend)) as client:
+            response = await client.request(method, f"{_tts_upstream_base_url(backend)}{path}", headers=headers, **kwargs)
             response.raise_for_status()
             return response
     except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=502, detail=f"Qwen3-TTS upstream error: {exc.response.text}") from exc
+        raise HTTPException(status_code=502, detail=f"TTS upstream error: {exc.response.text}") from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Qwen3-TTS upstream unreachable: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"TTS upstream unreachable: {exc}") from exc
 
 
 async def _tts_complete_audio(req: "SpeechRequest", response_format: str | None = None) -> bytes:
-    payload = _tts_request_payload(req, response_format=response_format, stream=False)
-    response = await _tts_request_with_failover("POST", "/v1/audio/speech", json=payload)
+    fmt = (response_format or req.response_format).lower()
+    backend = _tts_backend_for_request(req)
+    if backend == "tsukasa-speech":
+        return await _tsukasa_complete_audio(req, fmt)
+    if backend == "cosyvoice":
+        audio_bytes = await _fish_complete_audio(req, fmt)
+        audio, sample_rate = _decode_audio(audio_bytes)
+        return _encode_audio(audio, sample_rate, fmt)
+
+    payload = _tts_request_payload(req, response_format=fmt, stream=False, backend=backend)
+    response = await _tts_request_with_failover("POST", "/v1/audio/speech", backend=backend, json=payload)
     return response.content
 
 
 async def _tts_stream_audio(req: "SpeechRequest") -> AsyncGenerator[bytes, None]:
-    payload = _tts_request_payload(req, response_format="pcm", stream=True)
-    headers = _tts_upstream_headers()
+    backend = _tts_backend_for_request(req)
+    if backend == "tsukasa-speech":
+        async for chunk in _tsukasa_stream_audio(req):
+            yield chunk
+        return
+    if backend == "cosyvoice":
+        audio_bytes = await _fish_complete_audio(req, "pcm")
+        audio, sample_rate = _decode_audio(audio_bytes)
+        async for chunk in _pcm_stream_from_audio(audio, req.chunk_size or _fish_chunk_bytes() // 2):
+            yield chunk
+        return
+
+    payload = _tts_request_payload(req, response_format="pcm", stream=True, backend=backend)
+    headers = _tts_upstream_headers(backend)
     chunk_bytes = int(_env("TTS_UPSTREAM_STREAM_CHUNK_BYTES", str(_fish_chunk_bytes())))
     try:
-        async with httpx.AsyncClient(timeout=_tts_upstream_timeout()) as client:
+        async with httpx.AsyncClient(timeout=_tts_upstream_timeout(backend)) as client:
             async with client.stream(
                 "POST",
-                f"{_tts_upstream_base_url()}/v1/audio/speech",
+                f"{_tts_upstream_base_url(backend)}/v1/audio/speech",
                 json=payload,
                 headers=headers,
             ) as response:
@@ -729,15 +1071,18 @@ async def _tts_stream_audio(req: "SpeechRequest") -> AsyncGenerator[bytes, None]
                     if chunk:
                         yield chunk
     except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=502, detail=f"Qwen3-TTS upstream error: {exc.response.text}") from exc
+        detail_bytes = await exc.response.aread()
+        detail = detail_bytes.decode("utf-8", errors="replace") if detail_bytes else str(exc)
+        raise HTTPException(status_code=502, detail=f"TTS upstream error: {detail}") from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Qwen3-TTS upstream unreachable: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"TTS upstream unreachable: {exc}") from exc
 
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
+        "tts_backend": _tts_backend(),
         "stt_model_loaded": _stt_model is not None,
         "stt_model": _stt_model_name(),
         "stt_public_model": _stt_public_model_name(),
@@ -777,23 +1122,58 @@ async def models():
         },
     ]
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{_tts_upstream_base_url()}/v1/models", headers=_tts_upstream_headers())
-            response.raise_for_status()
-            payload = response.json()
-            upstream_models = payload.get("data") if isinstance(payload, dict) else None
-            if isinstance(upstream_models, list):
-                data.extend(upstream_models)
-    except (httpx.HTTPError, ValueError):
-        data.append(
-            {
-                "id": _tts_upstream_model_name(),
-                "object": "model",
-                "owned_by": "local",
-                "metadata": {"capabilities": ["speech"], "backend": "upstream"},
-            }
-        )
+    backend = _tts_backend()
+    if backend == "tsukasa-speech":
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(f"{_tsukasa_base_url()}/voices")
+                response.raise_for_status()
+                payload = response.json()
+                voices = payload.get("voices") if isinstance(payload, dict) else None
+                data.append(
+                    {
+                        "id": _tts_upstream_model_name(),
+                        "object": "model",
+                        "owned_by": "local",
+                        "metadata": {
+                            "capabilities": ["speech"],
+                            "backend": "tsukasa-speech",
+                            "sample_rate": _tsukasa_sample_rate(),
+                            "voices": voices if isinstance(voices, list) else [],
+                        },
+                    }
+                )
+        except (httpx.HTTPError, ValueError):
+            data.append(
+                {
+                    "id": _tts_upstream_model_name(),
+                    "object": "model",
+                    "owned_by": "local",
+                    "metadata": {
+                        "capabilities": ["speech"],
+                        "backend": "tsukasa-speech",
+                        "sample_rate": _tsukasa_sample_rate(),
+                    },
+                }
+            )
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(f"{_tts_upstream_base_url()}/v1/models", headers=_tts_upstream_headers())
+                response.raise_for_status()
+                payload = response.json()
+                upstream_models = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(upstream_models, list):
+                    data.extend(upstream_models)
+        except (httpx.HTTPError, ValueError):
+            data.append(
+                {
+                    "id": _tts_upstream_model_name(),
+                    "object": "model",
+                    "owned_by": "local",
+                    "metadata": {"capabilities": ["speech"], "backend": backend},
+                }
+            )
 
     return {"object": "list", "data": _dedupe_models(data)}
 
@@ -1091,6 +1471,7 @@ async def realtime_socket(websocket: WebSocket):
                                 "segments": segments,
                             }
                         )
+                        _apply_detected_tts_language(session, info.language)
                         await websocket.send_json(
                             {
                                 "type": "response.output_item.added",

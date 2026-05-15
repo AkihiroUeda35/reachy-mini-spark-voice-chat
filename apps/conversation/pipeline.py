@@ -105,15 +105,35 @@ async def _wait_for_event(websocket, event_types: set[str]) -> dict[str, Any]:
             return payload
 
 
-def _drain_ready_segments(buffer: str, *, final: bool) -> tuple[list[str], str]:
+def _drain_ready_segments(
+    buffer: str,
+    *,
+    final: bool,
+    newline_threshold: int,
+    max_chars: int,
+) -> tuple[list[str], str]:
     segments: list[str] = []
     start = 0
+    consecutive_newlines = 0
     for index, char in enumerate(buffer):
-        if char in "。！？!?\n":
-            segment = buffer[start : index + 1].strip()
+        if char == "\n":
+            consecutive_newlines += 1
+        else:
+            consecutive_newlines = 0
+
+        segment = buffer[start : index + 1]
+        should_split = False
+        if newline_threshold > 0 and consecutive_newlines >= newline_threshold:
+            should_split = True
+        elif max_chars > 0 and len(segment.strip()) >= max_chars:
+            should_split = True
+
+        if should_split:
+            segment = segment.strip()
             if segment:
                 segments.append(segment)
             start = index + 1
+            consecutive_newlines = 0
 
     remainder = buffer[start:]
     if final:
@@ -351,7 +371,12 @@ class ReachyTTSProcessor(FrameProcessor):
         if isinstance(frame, LLMTextFrame):
             if frame.text:
                 self._pending_text += frame.text
-                segments, remainder = _drain_ready_segments(self._pending_text, final=False)
+                segments, remainder = _drain_ready_segments(
+                    self._pending_text,
+                    final=False,
+                    newline_threshold=self._args.tts_segment_newline_threshold,
+                    max_chars=self._args.tts_segment_max_chars,
+                )
                 self._pending_text = remainder
                 if self._segment_queue is not None:
                     for segment in segments:
@@ -361,7 +386,12 @@ class ReachyTTSProcessor(FrameProcessor):
 
         if isinstance(frame, LLMFullResponseEndFrame):
             if self._segment_queue is not None:
-                segments, remainder = _drain_ready_segments(self._pending_text, final=True)
+                segments, remainder = _drain_ready_segments(
+                    self._pending_text,
+                    final=True,
+                    newline_threshold=self._args.tts_segment_newline_threshold,
+                    max_chars=self._args.tts_segment_max_chars,
+                )
                 self._pending_text = remainder
                 for segment in segments:
                     await self._segment_queue.put(segment)

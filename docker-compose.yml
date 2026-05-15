@@ -41,6 +41,7 @@ services:
       - ~/.cache/flashinfer:/root/.cache/flashinfer
       - ~/.triton:/root/.triton
       - ~/.cache/huggingface:/root/.cache/huggingface
+
   qwen3-tts:
     build:
       context: .
@@ -68,6 +69,29 @@ services:
     ipc: host
     restart: unless-stopped
 
+  tsukasa-speech:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: tsukasa-runtime
+    environment:
+      HF_HOME: /models/huggingface
+      TSUKASA_SPEECH_HOST: 0.0.0.0
+      TSUKASA_SPEECH_PORT: 5001
+      TSUKASA_SPEECH_REPO_ID: ${TSUKASA_SPEECH_REPO_ID:-Respair/Tsukasa_Speech}
+      TSUKASA_SPEECH_REPO_REF: ${TSUKASA_SPEECH_REPO_REF:-main}
+      TSUKASA_SPEECH_REPO_DIR: /models/tsukasa_speech/repo
+      TSUKASA_SPEECH_DEFAULT_VOICE: ${TSUKASA_SPEECH_DEFAULT_VOICE:-shiki_fine05}
+    ports:
+      - "${TSUKASA_SPEECH_PORT:-5001}:5001"
+    volumes:
+      - ./tts/tsukasa_speech:/workspace/tts/tsukasa_speech:ro
+      - ./tts/models/tsukasa_speech:/models/tsukasa_speech
+      - ~/.cache/huggingface:/models/huggingface
+    gpus: all
+    ipc: host
+    restart: unless-stopped
+
   voice-server:
     build:
       context: .
@@ -75,8 +99,6 @@ services:
       target: stt-runtime
       args:
         NGC_VLLM_IMAGE: ${STT_NGC_VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.04-py3}
-    depends_on:
-      - qwen3-tts
     ports:
       - "${VOICE_SERVER_PORT:-8020}:8020"
     gpus: all
@@ -92,14 +114,24 @@ services:
       STT_BEST_OF: ${STT_BEST_OF:-1}
       STT_CONDITION_ON_PREVIOUS_TEXT: ${STT_CONDITION_ON_PREVIOUS_TEXT:-0}
       OMP_NUM_THREADS: ${STT_CPU_THREADS:-14}
-      TTS_UPSTREAM_BASE_URL: ${TTS_UPSTREAM_BASE_URL:-http://qwen3-tts:8091}
-      TTS_UPSTREAM_MODEL: ${QWEN_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}
-      TTS_PUBLIC_MODEL_NAME: ${TTS_PUBLIC_MODEL_NAME:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}
+      TTS_BACKEND: ${TTS_BACKEND:-qwen3-tts}
+      TTS_UPSTREAM_BASE_URL: ${TTS_UPSTREAM_BASE_URL:-}
+      TTS_UPSTREAM_MODEL: ${TTS_UPSTREAM_MODEL:-}
+      TTS_PUBLIC_MODEL_NAME: ${TTS_PUBLIC_MODEL_NAME:-}
       TTS_UPSTREAM_TIMEOUT: ${QWEN_TTS_TIMEOUT:-600}
       TTS_DEFAULT_TASK_TYPE: ${TTS_DEFAULT_TASK_TYPE:-CustomVoice}
       TTS_DEFAULT_LANGUAGE: ${TTS_DEFAULT_LANGUAGE:-Japanese}
-      TTS_DEFAULT_VOICE: ${TTS_DEFAULT_VOICE:-Ono_Anna}
+      TTS_DEFAULT_VOICE: ${TTS_DEFAULT_VOICE:-default}
       QWEN_TTS_VOICES_FILE: /workspace/tts/voices/voices.json
+      TSUKASA_SPEECH_BASE_URL: ${TSUKASA_SPEECH_BASE_URL:-http://tsukasa-speech:5001}
+      TSUKASA_SPEECH_MODEL: ${TSUKASA_SPEECH_MODEL:-Respair/Tsukasa_Speech}
+      TSUKASA_SPEECH_PUBLIC_MODEL_NAME: ${TSUKASA_SPEECH_PUBLIC_MODEL_NAME:-Respair/Tsukasa_Speech}
+      TSUKASA_SPEECH_DEFAULT_VOICE: ${TSUKASA_SPEECH_DEFAULT_VOICE:-shiki_fine05}
+      TSUKASA_SPEECH_DEFAULT_DIFFUSION_STEPS: ${TSUKASA_SPEECH_DEFAULT_DIFFUSION_STEPS:-5}
+      TSUKASA_SPEECH_DEFAULT_EMBEDDING_SCALE: ${TSUKASA_SPEECH_DEFAULT_EMBEDDING_SCALE:-1.0}
+      TSUKASA_SPEECH_DEFAULT_ALPHA: ${TSUKASA_SPEECH_DEFAULT_ALPHA:-0.3}
+      TSUKASA_SPEECH_DEFAULT_BETA: ${TSUKASA_SPEECH_DEFAULT_BETA:-0.7}
+      TSUKASA_SPEECH_SAMPLE_RATE: ${TSUKASA_SPEECH_SAMPLE_RATE:-24000}
     volumes:
       - ./stt:/app:ro
       - ./tts:/workspace/tts:ro

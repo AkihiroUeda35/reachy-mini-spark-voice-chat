@@ -1,4 +1,5 @@
 ARG NGC_VLLM_IMAGE=nvcr.io/nvidia/vllm:26.04-py3
+ARG NGC_PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:25.04-py3
 
 FROM ${NGC_VLLM_IMAGE} AS vllm-base
 
@@ -127,3 +128,59 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 EXPOSE 8020
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8020"]
+
+FROM ${NGC_PYTORCH_IMAGE} AS tsukasa-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /workspace
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        git \
+        libsndfile1 \
+        mecab \
+        mecab-ipadic-utf8 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install --no-cache-dir \
+        SoundFile \
+        a_unet \
+        accelerate \
+        cutlet \
+        einops \
+        einops-exts \
+        fastapi \
+        fugashi \
+        huggingface_hub \
+        ipython \
+        konoha \
+        librosa \
+        matplotlib \
+        munch \
+        nltk \
+        openai \
+        pydub \
+        pyyaml \
+        scipy \
+        sentencepiece \
+        tqdm \
+        transformers==4.41.2 \
+        typing-extensions \
+        unidic-lite \
+        uvicorn[standard] \
+        xlstm \
+    && python -m pip install --no-cache-dir --no-deps torchaudio==2.7.0 \
+    && python -m pip install --no-cache-dir git+https://github.com/resemble-ai/monotonic_align.git
+
+COPY tts/tsukasa_speech/run.sh /workspace/tts/tsukasa_speech/run.sh
+COPY tts/tsukasa_speech/api.py /workspace/tts/tsukasa_speech/api.py
+
+EXPOSE 5001
+
+ENTRYPOINT ["sh", "/workspace/tts/tsukasa_speech/run.sh"]

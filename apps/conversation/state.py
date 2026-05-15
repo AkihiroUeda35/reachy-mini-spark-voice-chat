@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+import local_tts
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -15,9 +18,19 @@ DEFAULT_SELECTED_PROFILE_FILE = APP_DIR / "profiles" / ".selected_profile"
 COMMON_INSTRUCTIONS_FILE = APP_DIR / "profiles" / "common_instructions.txt"
 DEFAULT_CHARACTER_FILE = DEFAULT_PROFILE_DIR / "character.txt"
 DEFAULT_TOOLS_FILE = DEFAULT_PROFILE_DIR / "tools.txt"
-DEFAULT_VOICE = "Ono_Anna"
+DEFAULT_VOICE = "default"
+DEFAULT_TTS_INSTRUCTIONS = local_tts.TTS_INSTRUCTIONS
 
 VOICE_CHOICES: list[tuple[str, str]] = [
+    ("default", "Balanced default Tsukasa preset with natural pacing. [Tsukasa]"),
+    ("calm_guide", "Soft, reassuring Tsukasa preset for calm guidance. [Tsukasa]"),
+    ("captain", "Bold, energetic Tsukasa preset for adventurous banter. [Tsukasa]"),
+    ("lively_friend", "Bright, playful Tsukasa preset for friendly conversation. [Tsukasa]"),
+    ("operator", "Clean, restrained Tsukasa preset for concise answers. [Tsukasa]"),
+    ("samurai", "Measured, dignified Tsukasa preset with stronger weight. [Tsukasa]"),
+    ("shiki_fine05", "Refined direct Tsukasa reference voice. [Tsukasa]"),
+    ("kaede_san", "Gentle direct Tsukasa reference voice. [Tsukasa]"),
+    ("audio_ref", "Neutral bundled Tsukasa reference voice. [Tsukasa]"),
     ("Vivian", "Bright, slightly edgy young female voice. [Chinese]"),
     ("Serena", "Warm, gentle young female voice. [Chinese]"),
     ("Uncle_Fu", "Seasoned male voice with a low, mellow timbre. [Chinese]"),
@@ -49,13 +62,14 @@ class RuntimeSettings:
     active_character_prompt: str
     active_instructions: str
     active_voice: str
+    active_tts_instructions: str
     gui_tool_names: list[str]
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
         self._version = 0
 
-    def snapshot(self) -> tuple[str, list[str], str, str, str, int]:
+    def snapshot(self) -> tuple[str, list[str], str, str, str, str, int]:
         with self._lock:
             return (
                 self.active_profile,
@@ -63,6 +77,7 @@ class RuntimeSettings:
                 self.active_character_prompt,
                 self.active_instructions,
                 self.active_voice,
+                self.active_tts_instructions,
                 self._version,
             )
 
@@ -73,7 +88,8 @@ class RuntimeSettings:
         character_prompt: str,
         instructions: str,
         voice: str,
-    ) -> tuple[str, list[str], str, str, str, int]:
+        tts_instructions: str,
+    ) -> tuple[str, list[str], str, str, str, str, int]:
         normalized = [tool for tool in self.gui_tool_names if tool in enabled_tools]
         with self._lock:
             self.active_profile = profile
@@ -81,6 +97,7 @@ class RuntimeSettings:
             self.active_character_prompt = character_prompt.strip()
             self.active_instructions = instructions.strip()
             self.active_voice = voice
+            self.active_tts_instructions = tts_instructions.strip()
             self._version += 1
             return (
                 self.active_profile,
@@ -88,6 +105,7 @@ class RuntimeSettings:
                 self.active_character_prompt,
                 self.active_instructions,
                 self.active_voice,
+                self.active_tts_instructions,
                 self._version,
             )
 
@@ -227,12 +245,48 @@ def load_profile_prompt_by_name(profiles_dir: Path, profile: str, fallback: str)
     return compose_system_prompt(character_prompt)
 
 
+def _profile_voice_config_path(profile_dir: Path) -> Path:
+    return profile_dir / "voice.json"
+
+
+def _load_profile_voice_config(profile_dir: Path) -> dict[str, str]:
+    config_path = _profile_voice_config_path(profile_dir)
+    if config_path.is_file():
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            payload = {}
+        if isinstance(payload, dict):
+            voice = str(payload.get("voice") or "").strip()
+            tts_instructions = str(payload.get("tts_instructions") or "").strip()
+            return {
+                "voice": voice,
+                "tts_instructions": tts_instructions,
+            }
+
+    legacy_voice = _read_text_file(profile_dir / "voice.txt", "").strip()
+    return {
+        "voice": legacy_voice,
+        "tts_instructions": "",
+    }
+
+
 def load_profile_voice_by_name(profiles_dir: Path, profile: str, fallback: str = DEFAULT_VOICE) -> str:
     profile_dir = profiles_dir / profile
-    voice = _read_text_file(profile_dir / "voice.txt", fallback).strip()
+    voice = _load_profile_voice_config(profile_dir).get("voice", "").strip() or fallback
     if any(voice == name for name, _description in VOICE_CHOICES):
         return voice
     return fallback
+
+
+def load_profile_tts_instructions_by_name(
+    profiles_dir: Path,
+    profile: str,
+    fallback: str = DEFAULT_TTS_INSTRUCTIONS,
+) -> str:
+    profile_dir = profiles_dir / profile
+    tts_instructions = _load_profile_voice_config(profile_dir).get("tts_instructions", "").strip()
+    return tts_instructions or fallback
 
 
 def save_profile_definition(
@@ -241,6 +295,7 @@ def save_profile_definition(
     character_prompt: str,
     selected_tools: list[str],
     voice: str,
+    tts_instructions: str,
     gui_tool_names: list[str],
 ) -> Path:
     profile_dir = profiles_dir / profile
@@ -248,7 +303,18 @@ def save_profile_definition(
     (profile_dir / "character.txt").write_text(character_prompt.strip() + "\n", encoding="utf-8")
     ordered_tools = [tool for tool in gui_tool_names if tool in selected_tools]
     (profile_dir / "tools.txt").write_text("\n".join(ordered_tools) + "\n", encoding="utf-8")
-    (profile_dir / "voice.txt").write_text(voice.strip() + "\n", encoding="utf-8")
+    _profile_voice_config_path(profile_dir).write_text(
+        json.dumps(
+            {
+                "voice": voice.strip(),
+                "tts_instructions": tts_instructions.strip(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return profile_dir
 
 

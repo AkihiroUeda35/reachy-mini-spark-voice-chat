@@ -49,16 +49,16 @@ def refresh_settings() -> None:
     CHAT_MODEL_FALLBACK = os.environ.get("CHAT_MODEL_FALLBACK", "spark")
     TTS_BASE_URL = service_url("tts", "http://localhost:8020/v1")
     TTS_API_KEY = os.environ.get("TTS_API_KEY", "local")
-    VOICE = os.environ.get("TTS_VOICE", "Ono_Anna")
+    VOICE = os.environ.get("TTS_VOICE", "default")
     TTS_MODEL = os.environ.get("TTS_MODEL")
-    TTS_MODEL_FALLBACK = os.environ.get("TTS_MODEL_FALLBACK", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+    TTS_MODEL_FALLBACK = os.environ.get("TTS_MODEL_FALLBACK", "Respair/Tsukasa_Speech")
     TTS_TASK_TYPE = os.environ.get("TTS_TASK_TYPE", "CustomVoice")
     TTS_LANGUAGE = os.environ.get("TTS_LANGUAGE", "Japanese")
     TTS_SAMPLE_RATE = int(os.environ.get("TTS_SAMPLE_RATE", "24000"))
     TTS_USE_REALTIME_STREAMING = os.environ.get("TTS_USE_REALTIME_STREAMING", "1") != "0"
     TTS_INSTRUCTIONS = os.environ.get(
         "TTS_INSTRUCTIONS",
-        "Speak in natural standard Japanese with a bright, lively tone and clean articulation.",
+        "Speak in natural Japanese with clear emotion, smooth pacing, and a vivid but easy-to-listen tone.",
     )
     OUT_DIR = project_root() / os.environ.get("TTS_OUTPUT_DIR", "data")
     OUT_PATH = OUT_DIR / os.environ.get("TTS_OUTPUT_NAME", "spark_voice_chat.wav")

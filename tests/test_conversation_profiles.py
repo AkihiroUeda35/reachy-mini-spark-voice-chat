@@ -6,9 +6,11 @@ from pathlib import Path
 
 from main import (
     DEFAULT_CHARACTER_PROMPT,
+    DEFAULT_TTS_INSTRUCTIONS,
     DEFAULT_VOICE,
     load_profile_character_prompt_by_name,
     load_profile_prompt_by_name,
+    load_profile_tts_instructions_by_name,
     load_profile_voice_by_name,
     save_profile_definition,
 )
@@ -31,6 +33,7 @@ class ConversationProfileTests(unittest.TestCase):
                 "## CHARACTER\n\nBe playful.",
                 ["move_head", "camera"],
                 "Sohee",
+                "Speak with gentle enthusiasm.",
             )
 
             self.assertEqual(
@@ -38,6 +41,10 @@ class ConversationProfileTests(unittest.TestCase):
                 "## CHARACTER\n\nBe playful.",
             )
             self.assertEqual(load_profile_voice_by_name(profiles_dir, "tester", DEFAULT_VOICE), "Sohee")
+            self.assertEqual(
+                load_profile_tts_instructions_by_name(profiles_dir, "tester", DEFAULT_TTS_INSTRUCTIONS),
+                "Speak with gentle enthusiasm.",
+            )
             prompt = load_profile_prompt_by_name(profiles_dir, "tester", DEFAULT_CHARACTER_PROMPT)
             self.assertIn("## IDENTITY", prompt)
             self.assertIn("Be playful.", prompt)
@@ -51,6 +58,7 @@ class ConversationProfileTests(unittest.TestCase):
                 "## CHARACTER\n\nBe playful.",
                 ["camera"],
                 "Sohee",
+                DEFAULT_TTS_INSTRUCTIONS,
             )
 
             self.assertEqual(load_selected_profile_name(profiles_dir), "default")
@@ -64,6 +72,7 @@ class ConversationProfileTests(unittest.TestCase):
                 "## CHARACTER\n\nBe playful.",
                 ["camera"],
                 "Sohee",
+                DEFAULT_TTS_INSTRUCTIONS,
             )
 
             save_selected_profile_name(profiles_dir, "tester")

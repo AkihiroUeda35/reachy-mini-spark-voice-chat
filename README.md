@@ -47,6 +47,16 @@ Runs the OpenAI-compatible wrapper from the `stt-runtime` target.
 - STT warmup: enabled on startup by default
 - TTS upstream: `http://qwen3-tts:8091`
 
+### `tsukasa-speech`
+
+Runs a dedicated wrapper around [Respair/Tsukasa_Speech](https://huggingface.co/Respair/Tsukasa_Speech) for Japanese synthesis.
+
+- Default port: `5001`
+- Model repo: `Respair/Tsukasa_Speech`
+- Default sample rate: `24000`
+- Voice source: bundled `reference_sample_wavs` from the downloaded repo
+- Supports both voice-guided synthesis and prompt-guided synthesis when `instructions` are provided to `/v1/audio/speech`
+
 ## Requirements
 
 - Docker with Compose support
@@ -174,10 +184,18 @@ Use `LLM_*` variables for all LLM configuration.
 
 TTS:
 
+- `TTS_BACKEND`
 - `QWEN_TTS_MODEL`
 - `QWEN_TTS_GPU_MEMORY_UTILIZATION`
 - `QWEN_TTS_ENFORCE_EAGER`
 - `QWEN_TTS_NO_ASYNC_CHUNK`
+- `TSUKASA_SPEECH_REPO_ID`
+- `TSUKASA_SPEECH_REPO_REF`
+- `TSUKASA_SPEECH_DEFAULT_VOICE`
+- `TSUKASA_SPEECH_DEFAULT_DIFFUSION_STEPS`
+- `TSUKASA_SPEECH_DEFAULT_EMBEDDING_SCALE`
+- `TSUKASA_SPEECH_DEFAULT_ALPHA`
+- `TSUKASA_SPEECH_DEFAULT_BETA`
 
 Wrapper:
 
@@ -196,6 +214,32 @@ Wrapper:
 - `TTS_DEFAULT_LANGUAGE`
 - `TTS_DEFAULT_VOICE`
 - `TTS_PUBLIC_MODEL_NAME`
+
+To switch the wrapper to Respair's Tsukasa Speech backend, start the dedicated service and wrapper with `TTS_BACKEND=tsukasa-speech`.
+
+```bash
+TTS_BACKEND=tsukasa-speech docker compose up -d tsukasa-speech voice-server
+```
+
+Tsukasa Speech voice-guided smoke test:
+
+```bash
+curl -X POST http://localhost:8020/v1/audio/speech \
+	-H 'content-type: application/json' \
+	-d '{"model":"tts-1","input":"こんにちは","voice":"default","response_format":"wav","stream":false,"language":"Japanese"}' \
+	-o /tmp/tsukasa-wrapper.wav
+file /tmp/tsukasa-wrapper.wav
+```
+
+Tsukasa Speech prompt-guided smoke test:
+
+```bash
+curl -X POST http://localhost:8020/v1/audio/speech \
+	-H 'content-type: application/json' \
+	-d '{"model":"tts-1","input":"きょうはいいてんきですね。","voice":"calm_guide","instructions":"Speak softly, warmly, and a little thoughtfully.","response_format":"wav","stream":false,"language":"Japanese"}' \
+	-o /tmp/tsukasa-prompt.wav
+file /tmp/tsukasa-prompt.wav
+```
 
 Script entry point layer:
 

@@ -28,7 +28,7 @@ from openai_model_registry import resolve_model
 
 from gradio_ui import launch_gradio_ui
 from pipeline import SynthesizedAudio, _resample_audio, run_pipeline
-from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, AssistantSpeechState, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, listening_gate_settings, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_voice_by_name, load_selected_profile_name, overlap_turn_rejection_reason, save_profile_definition as _save_profile_definition
+from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, DEFAULT_TTS_INSTRUCTIONS, AssistantSpeechState, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, listening_gate_settings, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_tts_instructions_by_name, load_profile_voice_by_name, load_selected_profile_name, overlap_turn_rejection_reason, save_profile_definition as _save_profile_definition
 
 load_entrypoint_env(local_tts, asr_tools)
 
@@ -49,6 +49,8 @@ TTS_SAMPLE_RATE = local_tts.TTS_SAMPLE_RATE
 VOICE = local_tts.VOICE
 
 TTS_TRANSPORT = os.environ.get("TTS_TRANSPORT", "realtime")
+TTS_SEGMENT_NEWLINE_THRESHOLD = int(os.environ.get("TTS_SEGMENT_NEWLINE_THRESHOLD", "2"))
+TTS_SEGMENT_MAX_CHARS = int(os.environ.get("TTS_SEGMENT_MAX_CHARS", "100"))
 SHUTDOWN_STEP_TIMEOUT_S = 2.0
 
 
@@ -69,8 +71,9 @@ def save_profile_definition(
     character_prompt: str,
     selected_tools: list[str],
     voice: str,
+    tts_instructions: str,
 ) -> Path:
-    return _save_profile_definition(profiles_dir, profile, character_prompt, selected_tools, voice, GUI_TOOL_NAMES)
+    return _save_profile_definition(profiles_dir, profile, character_prompt, selected_tools, voice, tts_instructions, GUI_TOOL_NAMES)
 
 
 def load_profile_prompt(args: argparse.Namespace) -> str:
@@ -146,6 +149,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tts-instructions", default=TTS_INSTRUCTIONS, help="Instructions sent to the TTS wrapper.")
     parser.add_argument("--tts-sample-rate", type=int, default=TTS_SAMPLE_RATE, help="Expected TTS sample rate.")
     parser.add_argument("--tts-transport", choices=["realtime", "http"], default=TTS_TRANSPORT, help="TTS transport used for streaming.")
+    parser.add_argument("--tts-segment-newline-threshold", type=int, default=TTS_SEGMENT_NEWLINE_THRESHOLD, help="Flush streamed TTS text only after this many consecutive newlines. Set to 0 to disable newline-based flushing.")
+    parser.add_argument("--tts-segment-max-chars", type=int, default=TTS_SEGMENT_MAX_CHARS, help="Flush streamed TTS text once the buffered segment reaches this many characters. Set to 0 to disable length-based flushing.")
     parser.add_argument("--save-replies", action=argparse.BooleanOptionalAction, default=False, help="Save synthesized assistant replies as WAV files.")
     return parser.parse_args()
 
@@ -410,6 +415,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
     args.profile = args.profile or load_selected_profile_name(profiles_dir)
     args.system_prompt = load_profile_prompt(args)
     args.voice = load_profile_voice_by_name(profiles_dir, args.profile, args.voice or DEFAULT_VOICE)
+    args.tts_instructions = load_profile_tts_instructions_by_name(profiles_dir, args.profile, args.tts_instructions or DEFAULT_TTS_INSTRUCTIONS)
     resolve_runtime_models(args)
     runtime_settings = RuntimeSettings(
         profiles_dir=profiles_dir,
@@ -418,6 +424,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
         active_character_prompt=load_profile_character_prompt_by_name(profiles_dir, args.profile, DEFAULT_CHARACTER_PROMPT),
         active_instructions=load_profile_prompt_by_name(profiles_dir, args.profile, DEFAULT_CHARACTER_PROMPT),
         active_voice=load_profile_voice_by_name(profiles_dir, args.profile, args.voice or DEFAULT_VOICE),
+        active_tts_instructions=load_profile_tts_instructions_by_name(profiles_dir, args.profile, args.tts_instructions or DEFAULT_TTS_INSTRUCTIONS),
         gui_tool_names=GUI_TOOL_NAMES,
     )
 
@@ -475,7 +482,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
         app_logger.info("[bold]Reachy media pipelines started[/]")
 
         while not stop_event.is_set():
-            active_profile, active_tools, _active_character_prompt, active_instructions, active_voice, settings_version = runtime_settings.snapshot()
+            active_profile, active_tools, _active_character_prompt, active_instructions, active_voice, active_tts_instructions, settings_version = runtime_settings.snapshot()
             if settings_version != last_settings_version:
                 history.clear()
                 last_settings_version = settings_version
@@ -483,6 +490,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
             args.profile = active_profile
             args.system_prompt = active_instructions
             args.voice = active_voice
+            args.tts_instructions = active_tts_instructions
             captured_utterance = await capture_robot_utterance(robot, args, assistant_speech_state=assistant_speech_state)
             if captured_utterance is None or stop_event.is_set():
                 continue
