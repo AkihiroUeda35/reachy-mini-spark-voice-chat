@@ -54,7 +54,7 @@ def refresh_settings() -> None:
     ASR_API_KEY = os.environ.get("ASR_API_KEY", "local")
     ASR_MODEL = os.environ.get("ASR_MODEL")
     ASR_MODEL_FALLBACK = os.environ.get("ASR_MODEL_FALLBACK", "whisper-1")
-    ASR_LANGUAGE = os.environ.get("ASR_LANGUAGE", "ja")
+    ASR_LANGUAGE = os.environ.get("ASR_LANGUAGE", "auto")
     ASR_TIMEOUT = float(os.environ.get("ASR_TIMEOUT", "600"))
     ASR_TRANSPORT = os.environ.get("ASR_TRANSPORT", "realtime")
     ASR_SAMPLE_RATE = int(os.environ.get("ASR_SAMPLE_RATE", "16000"))
@@ -169,6 +169,13 @@ def _normalized_language(language: str | None) -> str | None:
     return normalized
 
 
+def apply_language_hint(args: argparse.Namespace, language: str | None = None) -> str | None:
+    raw_language = args.language if language is None else language
+    normalized_language = _normalized_language(raw_language)
+    args.language = normalized_language or "auto"
+    return normalized_language
+
+
 def _pcm16_bytes(audio: np.ndarray) -> bytes:
     return np.clip(audio * 32768, -32768, 32767).astype(np.int16).tobytes()
 
@@ -271,7 +278,7 @@ def _http_form_data(args: argparse.Namespace) -> dict[str, str]:
         "response_format": args.response_format,
         "temperature": str(args.temperature),
     }
-    language = _normalized_language(args.language)
+    language = apply_language_hint(args)
     if language:
         form_data["language"] = language
     if args.prompt:
@@ -395,7 +402,7 @@ async def transcribe_realtime_microphone(args: argparse.Namespace) -> tuple[str 
         "input_audio_format": "pcm16",
         "input_audio_sample_rate": args.sample_rate,
     }
-    language = _normalized_language(args.language)
+    language = apply_language_hint(args)
     if language:
         session["input_audio_transcription"]["language"] = language
     if args.prompt:
@@ -513,7 +520,7 @@ async def transcribe_realtime(args: argparse.Namespace, audio: PreparedAudio) ->
         "input_audio_format": "pcm16",
         "input_audio_sample_rate": audio.sample_rate,
     }
-    language = _normalized_language(args.language)
+    language = apply_language_hint(args)
     if language:
         session["input_audio_transcription"]["language"] = language
     if args.prompt:

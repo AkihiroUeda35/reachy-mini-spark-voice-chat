@@ -108,7 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-key", default=asr_tools.ASR_API_KEY, help="Bearer token for the STT endpoint.")
     parser.add_argument("--model", default=asr_tools.ASR_MODEL, help="STT model name.")
     parser.add_argument("--transport", choices=["realtime", "http"], default=asr_tools.ASR_TRANSPORT, help="STT transport to use.")
-    parser.add_argument("--language", default=asr_tools.ASR_LANGUAGE, help="Language hint for STT.")
+    parser.add_argument("--language", "--lang", default=asr_tools.ASR_LANGUAGE, help="Language hint for STT. Use 'auto' to enable autodetection.")
     parser.add_argument("--prompt", help="Optional STT transcription prompt.")
     parser.add_argument("--response-format", choices=["text", "json", "verbose_json"], default="text", help="STT response format.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature for HTTP STT.")
@@ -308,7 +308,13 @@ async def capture_robot_utterance(
 async def transcribe_captured_audio(args: argparse.Namespace, utterance: CapturedUtterance) -> str | dict:
     logger = logging.getLogger("conversation.asr")
     audio = utterance.audio
-    logger.info("[bold blue]ASR[/] sending %.2fs of audio to %s", len(audio.pcm16_bytes) / 2 / audio.sample_rate, args.base_url)
+    applied_language = asr_tools.apply_language_hint(args)
+    logger.info(
+        "[bold blue]ASR[/] sending %.2fs of audio to %s language=%s",
+        len(audio.pcm16_bytes) / 2 / audio.sample_rate,
+        args.base_url,
+        applied_language or "auto",
+    )
     started_at = perf_counter()
     if args.transport == "realtime":
         payload = await asr_tools.transcribe_realtime(args, audio)

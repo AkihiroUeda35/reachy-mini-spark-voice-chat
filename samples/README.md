@@ -33,7 +33,7 @@ uv run python samples/langchain_openai_tts.py
 
 Use the local OpenAI-compatible STT endpoint to transcribe either a microphone capture or a file. The script uses the Realtime API by default, saves the transcript result to `./data/` by default, and can fall back to plain HTTP multipart uploads when needed.
 
-The tool defaults to `--language ja` so Whisper can skip language autodetection for faster Japanese transcription. Pass `--language auto` if you want autodetection back.
+The tool defaults to `--language auto` so Whisper can autodetect the spoken language. Pass `--language ja` if you want to force Japanese for potentially faster, more stable Japanese transcription.
 
 ```bash
 cd ..
