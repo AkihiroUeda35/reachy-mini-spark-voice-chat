@@ -6,8 +6,10 @@ from dataclasses import dataclass
 import logging
 import os
 import signal
+import sys
 import threading
 import wave
+import json
 from collections import deque
 from contextlib import suppress
 from datetime import datetime
@@ -32,8 +34,8 @@ from config import load_entrypoint_env
 from openai_model_registry import resolve_model
 
 from gradio_ui import launch_gradio_ui
-from pipeline import ReachyAudioPlayer, ReachyRealtimeTTSSession, SynthesizedAudio, _resample_audio, run_pipeline, synthesize_audio_stream, synthesize_realtime_audio_stream
-from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, DEFAULT_TTS_INSTRUCTIONS, AssistantSpeechState, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, build_tts_request_voice, listening_gate_settings, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_qwen_voice_by_name, load_profile_tts_instructions_by_name, load_profile_voice_by_name, load_selected_profile_name, overlap_turn_rejection_reason, save_profile_definition as _save_profile_definition
+from pipeline import ReachyAudioPlayer, ReachyRealtimeTTSSession, SynthesizedAudio, _drain_ready_segments, _resample_audio, run_pipeline, synthesize_audio_stream, synthesize_realtime_audio_stream
+from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, DEFAULT_TTS_INSTRUCTIONS, AssistantSpeechState, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, build_tts_request_voice, effective_tts_transport, listening_gate_settings, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_qwen_voice_by_name, load_profile_tts_instructions_by_name, load_profile_voice_by_name, load_selected_profile_name, normalize_tts_backend_name, overlap_turn_rejection_reason, save_profile_definition as _save_profile_definition
 
 load_entrypoint_env(local_tts, asr_tools)
 
@@ -51,6 +53,8 @@ TTS_TASK_TYPE = local_tts.TTS_TASK_TYPE
 TTS_LANGUAGE = local_tts.TTS_LANGUAGE
 TTS_INSTRUCTIONS = local_tts.TTS_INSTRUCTIONS
 TTS_SAMPLE_RATE = local_tts.TTS_SAMPLE_RATE
+TTS_BACKEND = os.environ.get("TTS_BACKEND", "")
+TTS_DEBUG_CAPTURE = os.environ.get("TTS_DEBUG_CAPTURE", "0") not in {"", "0", "false", "False", "no", "off"}
 VOICE = local_tts.VOICE
 
 TTS_TRANSPORT = os.environ.get("TTS_TRANSPORT", "realtime")
@@ -239,7 +243,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--tts-base-url", default=TTS_BASE_URL, help="OpenAI-compatible TTS base URL.")
     parser.add_argument("--tts-api-key", default=TTS_API_KEY, help="Bearer token for the TTS endpoint.")
-    parser.add_argument("--tts-backend", default=None, help="Optional TTS backend override. Leave unset to use the TTS wrapper backend from its environment.")
+    parser.add_argument("--tts-backend", default=TTS_BACKEND or None, help="Optional TTS backend override. Leave unset to use the TTS wrapper backend from its environment.")
     parser.add_argument("--tts-model", default=TTS_MODEL, help="TTS model name.")
     parser.add_argument("--tts-task-type", default=TTS_TASK_TYPE, help="TTS task type.")
     parser.add_argument("--tts-language", default=TTS_LANGUAGE, help="TTS language.")
@@ -249,8 +253,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tts-transport", choices=["realtime", "http"], default=TTS_TRANSPORT, help="TTS transport used for streaming.")
     parser.add_argument("--tts-segment-newline-threshold", type=int, default=TTS_SEGMENT_NEWLINE_THRESHOLD, help="Flush streamed TTS text only after this many consecutive newlines. Set to 0 to disable newline-based flushing.")
     parser.add_argument("--tts-segment-max-chars", type=int, default=TTS_SEGMENT_MAX_CHARS, help="Flush streamed TTS text once the buffered segment reaches this many characters. Set to 0 to disable length-based flushing.")
+    parser.add_argument("--tts-debug-capture", action=argparse.BooleanOptionalAction, default=TTS_DEBUG_CAPTURE, help="When enabled, save synthesized reply audio plus a reverse-transcription debug manifest for TTS dropout diagnosis.")
     parser.add_argument("--save-replies", action=argparse.BooleanOptionalAction, default=False, help="Save synthesized assistant replies as WAV files.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.tts_transport_explicit = any(
+        argument == "--tts-transport" or argument.startswith("--tts-transport=")
+        for argument in sys.argv[1:]
+    )
+    args.tts_transport = effective_tts_transport(
+        args.tts_transport,
+        args.tts_backend,
+        transport_explicit=args.tts_transport_explicit,
+    )
+    return args
 
 
 def _mono_audio(audio: np.ndarray) -> np.ndarray:
@@ -469,6 +484,101 @@ def save_reply_audio(data_dir: Path, audio: SynthesizedAudio) -> Path:
     return output_path
 
 
+def _debug_reply_manifest_path(saved_audio: Path) -> Path:
+    return saved_audio.with_name(f"{saved_audio.stem}_debug.json")
+
+
+def _debug_reply_segments(text: str, args: argparse.Namespace) -> list[str]:
+    segments, remainder = _drain_ready_segments(
+        text,
+        final=False,
+        newline_threshold=args.tts_segment_newline_threshold,
+        max_chars=args.tts_segment_max_chars,
+    )
+    tail_segments, _tail_remainder = _drain_ready_segments(
+        remainder,
+        final=True,
+        newline_threshold=args.tts_segment_newline_threshold,
+        max_chars=args.tts_segment_max_chars,
+    )
+    return [*segments, *tail_segments]
+
+
+def _prepared_reply_audio(saved_audio: Path, audio: SynthesizedAudio) -> asr_tools.PreparedAudio:
+    if audio.num_channels != 1:
+        raise ValueError(f"TTS debug capture only supports mono audio, got {audio.num_channels} channels")
+    return asr_tools.PreparedAudio(
+        source_stem=saved_audio.stem,
+        filename=saved_audio.name,
+        mime_type="audio/wav",
+        upload_bytes=asr_tools._wav_bytes(audio.pcm16_bytes, audio.sample_rate),
+        pcm16_bytes=audio.pcm16_bytes,
+        sample_rate=audio.sample_rate,
+    )
+
+
+def _reverse_transcription_args(args: argparse.Namespace) -> argparse.Namespace:
+    language_hint = args.language
+    if isinstance(args.tts_language, str) and args.tts_language.strip().lower().startswith("japanese"):
+        language_hint = "ja"
+    elif isinstance(args.tts_language, str) and args.tts_language.strip().lower().startswith("english"):
+        language_hint = "en"
+    return argparse.Namespace(
+        base_url=args.base_url,
+        api_key=args.api_key,
+        model=args.model,
+        transport="http",
+        language=language_hint,
+        prompt=None,
+        response_format="json",
+        temperature=0.0,
+        word_timestamps=False,
+        sample_rate=args.sample_rate,
+        realtime_chunk_ms=args.realtime_chunk_ms,
+    )
+
+
+async def capture_tts_debug_artifacts(
+    args: argparse.Namespace,
+    data_dir: Path,
+    audio: SynthesizedAudio,
+    assistant_text: str,
+    *,
+    saved_audio: Path | None = None,
+) -> None:
+    tts_logger = logging.getLogger("conversation.tts")
+    reply_audio_path = saved_audio or save_reply_audio(data_dir, audio)
+    manifest_path = _debug_reply_manifest_path(reply_audio_path)
+    payload: dict[str, Any] = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "assistant_text": assistant_text,
+        "tts_transport": args.tts_transport,
+        "tts_backend": normalize_tts_backend_name(args.tts_backend or TTS_BACKEND),
+        "tts_model": args.tts_model,
+        "tts_language": args.tts_language,
+        "tts_voice": args.voice,
+        "tts_segments": _debug_reply_segments(assistant_text, args),
+        "reply_audio_path": str(reply_audio_path),
+    }
+
+    try:
+        reverse_args = _reverse_transcription_args(args)
+        prepared_audio = _prepared_reply_audio(reply_audio_path, audio)
+        started_at = perf_counter()
+        reverse_payload = await asyncio.to_thread(asr_tools.transcribe_http, reverse_args, prepared_audio)
+        payload["reverse_transcription"] = reverse_payload
+        tts_logger.info(
+            "[bold green]TTS[/] debug reverse transcription finished in %.2fs",
+            perf_counter() - started_at,
+        )
+    except Exception as exc:
+        payload["reverse_transcription_error"] = f"{type(exc).__name__}: {exc}"
+        tts_logger.warning("[bold green]TTS[/] debug reverse transcription failed: %s", exc)
+
+    manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tts_logger.info("[bold green]TTS[/] debug capture saved to %s", manifest_path)
+
+
 async def _run_blocking_cleanup_step(logger: logging.Logger, name: str, func: Any, timeout_s: float = SHUTDOWN_STEP_TIMEOUT_S) -> None:
     error: list[BaseException] = []
     finished = threading.Event()
@@ -670,9 +780,18 @@ async def conversation_loop(args: argparse.Namespace) -> int:
             )
             history = trim_history(history, args.history_turns)
 
+            saved_audio: Path | None = None
             if args.save_replies:
                 saved_audio = save_reply_audio(data_dir, result.audio)
                 logging.getLogger("conversation.tts").info("[bold green]TTS[/] reply saved to %s", saved_audio)
+            if args.tts_debug_capture:
+                await capture_tts_debug_artifacts(
+                    args,
+                    data_dir,
+                    result.audio,
+                    result.assistant_text,
+                    saved_audio=saved_audio,
+                )
     except (KeyboardInterrupt, asyncio.CancelledError):
         interrupted = True
         app_logger.info("[bold]Interrupted, shutting down[/]")

@@ -6,6 +6,9 @@ import base64
 import json
 import logging
 import os
+import queue
+import threading
+import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
@@ -33,6 +36,10 @@ from reachy_conversation_tools import ReachyToolRuntime, build_langchain_tools
 
 TTS_TIMEOUT = float(os.environ.get("TTS_TIMEOUT", "600"))
 TTS_STREAM_CHUNK_BYTES = int(os.environ.get("TTS_STREAM_CHUNK_BYTES", "8192"))
+REACHY_AUDIO_PUSH_CHUNK_MS = int(
+    os.environ.get("REACHY_AUDIO_PUSH_CHUNK_MS", os.environ.get("REACHY_AUDIO_BATCH_MS", "20"))
+)
+REACHY_AUDIO_MAX_AHEAD_MS = int(os.environ.get("REACHY_AUDIO_MAX_AHEAD_MS", "500"))
 
 
 @dataclass
@@ -499,17 +506,69 @@ class ReachyAudioPlayer(FrameProcessor):
         ) if enable_head_wobble else None
         self._assistant_speech_state = assistant_speech_state
         self._closed = False
+        self._playback_chunk_ms = max(10, REACHY_AUDIO_PUSH_CHUNK_MS)
+        max_ahead_ms = max(self._playback_chunk_ms, REACHY_AUDIO_MAX_AHEAD_MS)
+        self._playback_queue_limit = max(1, (max_ahead_ms + self._playback_chunk_ms - 1) // self._playback_chunk_ms)
+        self._playback_queue: queue.Queue[tuple[np.ndarray, int] | None] = queue.Queue(maxsize=self._playback_queue_limit)
+        self._playback_thread: threading.Thread | None = None
+        self._playback_stop = threading.Event()
 
     def close(self, timeout_s: float | None = None) -> None:
         if self._closed:
             return
         self._closed = True
+        self._stop_playback_worker()
         if self._head_wobbler is None:
             return
         finished = self._head_wobbler.finish(timeout_s=timeout_s)
         if timeout_s is not None and not finished:
             self._logger.warning("Head wobble reset timed out")
         self._head_wobbler.stop()
+
+    def _ensure_playback_worker(self) -> None:
+        if self._playback_thread is not None and self._playback_thread.is_alive():
+            return
+        self._playback_stop.clear()
+        self._playback_thread = threading.Thread(target=self._playback_loop, name="reachy-audio-playback", daemon=True)
+        self._playback_thread.start()
+
+    def _stop_playback_worker(self) -> None:
+        if self._playback_thread is None:
+            return
+        self._playback_queue.put(None)
+        self._playback_queue.join()
+        self._playback_stop.set()
+        self._playback_thread.join(timeout=1.0)
+        self._playback_thread = None
+
+    def _playback_loop(self) -> None:
+        next_push_at: float | None = None
+        while not self._playback_stop.is_set():
+            try:
+                item = self._playback_queue.get(timeout=0.05)
+            except queue.Empty:
+                next_push_at = None
+                continue
+
+            if item is None:
+                self._playback_queue.task_done()
+                return
+
+            waveform, sample_rate = item
+            chunk_duration_s = max(0.001, waveform.shape[0] / max(1, sample_rate))
+
+            try:
+                current_time = time.monotonic()
+                if next_push_at is None or current_time > next_push_at + chunk_duration_s:
+                    next_push_at = current_time
+                elif next_push_at > current_time:
+                    self._playback_stop.wait(next_push_at - current_time)
+                    if self._playback_stop.is_set():
+                        return
+                self._robot.media.push_audio_sample(waveform)
+                next_push_at = max(next_push_at, time.monotonic()) + chunk_duration_s
+            finally:
+                self._playback_queue.task_done()
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -528,7 +587,11 @@ class ReachyAudioPlayer(FrameProcessor):
             if not self._started:
                 self._logger.info("[bold yellow]Audio[/] streaming assistant reply to Reachy speaker")
                 self._started = True
-            await asyncio.to_thread(self._robot.media.push_audio_sample, waveform)
+            self._ensure_playback_worker()
+            chunk_frames = max(1, int(round(output_rate * self._playback_chunk_ms / 1000.0)))
+            for start in range(0, waveform.shape[0], chunk_frames):
+                chunk = np.array(waveform[start : start + chunk_frames], copy=True)
+                await asyncio.to_thread(self._playback_queue.put, (chunk, output_rate))
         elif isinstance(frame, EndFrame):
             self._started = False
             if self._head_wobbler is not None:

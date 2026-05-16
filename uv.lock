@@ -2241,7 +2241,7 @@ wheels = [
 
 [[package]]
 name = "reachy-mini"
-version = "1.7.1"
+version = "1.7.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -2276,9 +2276,9 @@ dependencies = [
     { name = "websockets" },
     { name = "zeroconf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/05/fb/7df6fff733cf6bb63b702bb1eb8252cdf27e8b0ac1ee21e408aea78154c9/reachy_mini-1.7.1.tar.gz", hash = "sha256:39fc3c9a94145c53a217265a4702a615690e7791b1bd18aa66f229f33ab122ac", size = 24722394, upload-time = "2026-05-04T12:59:31.135Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a5/6e/13c306ae5f8e596fef397dafe26fdb3519812eacb3c6eb6e32fc5149cfd8/reachy_mini-1.7.3.tar.gz", hash = "sha256:adc0b0b2febfe6224919069d6080f93fb88d0af0dd0411e776471d1441f81e45", size = 24737633, upload-time = "2026-05-13T14:30:32.09Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/eb/a7/6b969c2953fb9bcf196e9c19f30c70246b8bc6e7bf130747ac09885bb70d/reachy_mini-1.7.1-py3-none-any.whl", hash = "sha256:84657726f0a84b8cc146a0223516a4973173fb71b18f10f23c8fd6e48974cbc2", size = 24820126, upload-time = "2026-05-04T12:59:28.268Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/fc/e464236bde6e25a3dde4655973076962c756a2da46c37f2adb25c8363ce1/reachy_mini-1.7.3-py3-none-any.whl", hash = "sha256:209c712b31ccf77b8ff7d861c4598a1e0f4596656a161b12d1e4068bc76fe006", size = 24834307, upload-time = "2026-05-13T14:30:28.406Z" },
 ]
 
 [[package]]
@@ -2731,7 +2731,7 @@ requires-dist = [
     { name = "opencv-python-headless", specifier = ">=4.10.0" },
     { name = "pillow", specifier = ">=12.0.0" },
     { name = "pipecat-ai", specifier = ">=1.1.0" },
-    { name = "reachy-mini", specifier = "==1.7.1" },
+    { name = "reachy-mini", specifier = "==1.7.3" },
     { name = "reachy-mini-dances-library", specifier = ">=0.2.1" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "sounddevice", specifier = ">=0.5.5" },

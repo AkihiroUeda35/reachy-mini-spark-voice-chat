@@ -258,7 +258,7 @@ class HeadWobbler:
         get_current_head_pose: Callable[[], NDArray[np.float64]] | None = None,
         get_origin_head_pose: Callable[[], NDArray[np.float64] | None] | None = None,
         *,
-        movement_latency_s: float = 0.2,
+        movement_latency_s: float = 0.05,
         reset_center_ratio: float = 1.0,
     ) -> None:
         self._logger = logging.getLogger(f"{__name__}.wobbler")

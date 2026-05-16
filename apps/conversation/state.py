@@ -54,6 +54,32 @@ DEFAULT_QWEN_VOICE = "Ono_Anna"
 TSUKASA_SPEECH_BASE_URL = os.environ.get("TSUKASA_SPEECH_BASE_URL", "http://localhost:5001").rstrip("/")
 
 
+def normalize_tts_backend_name(backend: str | None) -> str:
+    normalized = (backend or "").strip().lower()
+    aliases = {
+        "qwen": "qwen3-tts",
+        "qwen3": "qwen3-tts",
+        "qwen3-tts": "qwen3-tts",
+        "cosy": "cosyvoice",
+        "cosyvoice": "cosyvoice",
+        "fish": "cosyvoice",
+        "fish-speech": "cosyvoice",
+        "tsukasa": "tsukasa-speech",
+        "tsukasa-speech": "tsukasa-speech",
+        "tsukasa_speech": "tsukasa-speech",
+        "respair-tsukasa": "tsukasa-speech",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def effective_tts_transport(tts_transport: str, tts_backend: str | None, *, transport_explicit: bool = False) -> str:
+    if transport_explicit:
+        return tts_transport
+    if normalize_tts_backend_name(tts_backend) == "tsukasa-speech":
+        return "http"
+    return tts_transport
+
+
 def _fetch_tsukasa_voice_catalog(base_url: str | None = None, timeout_s: float = 1.0) -> tuple[list[str], str]:
     voice_base_url = (base_url or TSUKASA_SPEECH_BASE_URL).rstrip("/")
     if not voice_base_url:

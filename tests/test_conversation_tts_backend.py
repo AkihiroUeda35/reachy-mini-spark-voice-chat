@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import sys
 import unittest
@@ -8,7 +9,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "conversation"))
 
-from pipeline import _tts_http_request_payload, _tts_session_update_payload
+pipeline = importlib.import_module("pipeline")
+effective_tts_transport = importlib.import_module("state").effective_tts_transport
+_tts_http_request_payload = pipeline._tts_http_request_payload
+_tts_session_update_payload = pipeline._tts_session_update_payload
 
 
 class ConversationTTSBackendTests(unittest.TestCase):
@@ -43,6 +47,12 @@ class ConversationTTSBackendTests(unittest.TestCase):
 
         self.assertEqual(session["backend"], "tsukasa")
         json.dumps(session)
+
+    def test_effective_transport_prefers_http_for_tsukasa_when_not_explicit(self) -> None:
+        self.assertEqual(effective_tts_transport("realtime", "tsukasa", transport_explicit=False), "http")
+
+    def test_effective_transport_keeps_explicit_transport_choice(self) -> None:
+        self.assertEqual(effective_tts_transport("realtime", "tsukasa-speech", transport_explicit=True), "realtime")
 
 
 if __name__ == "__main__":
