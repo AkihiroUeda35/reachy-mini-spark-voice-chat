@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import logging
+import mimetypes
 import os
 import threading
 import time
@@ -21,7 +24,20 @@ COMMON_INSTRUCTIONS_FILE = APP_DIR / "profiles" / "common_instructions.txt"
 DEFAULT_CHARACTER_FILE = DEFAULT_PROFILE_DIR / "character.txt"
 DEFAULT_TOOLS_FILE = DEFAULT_PROFILE_DIR / "tools.txt"
 DEFAULT_VOICE = "default"
+CUSTOM_VOICE = "custom"
 DEFAULT_TTS_INSTRUCTIONS = local_tts.TTS_INSTRUCTIONS
+logger = logging.getLogger("conversation.state")
+PROFILE_TTS_PROMPT_AUDIO_STEMS: dict[str, str] = {
+    "tsukasa-speech": "japanese",
+    "qwen3-tts": "english",
+}
+PROFILE_TTS_PROMPT_TEXT_STEMS: dict[str, str] = {
+    "qwen3-tts": "english",
+}
+PROFILE_TTS_PROMPT_TEXT_LANGUAGE_HINTS: dict[str, str] = {
+    "english": "en",
+}
+PROFILE_TTS_PROMPT_AUDIO_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
 
 VOICE_CHOICES: list[tuple[str, str]] = [
     ("audio_ref", "Bundled Tsukasa reference voice. [Tsukasa]"),
@@ -117,7 +133,43 @@ def normalize_tsukasa_voice(voice: str, base_url: str | None = None) -> str:
     return voices[0]
 
 
-def tsukasa_voice_choices(current_voice: str = "", base_url: str | None = None) -> list[tuple[str, str]]:
+def is_custom_voice_choice(voice: str | None) -> bool:
+    return (voice or "").strip().lower() == CUSTOM_VOICE
+
+
+def _profile_has_prompt_audio(profile_dir: Path, backend: str) -> bool:
+    stem = PROFILE_TTS_PROMPT_AUDIO_STEMS.get(backend)
+    return bool(stem and _find_profile_prompt_audio_file(profile_dir, stem) is not None)
+
+
+def profile_has_prompt_audio_by_name(profiles_dir: Path, profile: str, backend: str) -> bool:
+    return _profile_has_prompt_audio(profiles_dir / profile, backend)
+
+
+def _resolve_profile_tsukasa_voice_choice(profile_dir: Path, voice: str, fallback: str = DEFAULT_VOICE) -> str:
+    resolved = voice.strip()
+    if not resolved:
+        return fallback
+    if is_custom_voice_choice(resolved):
+        return CUSTOM_VOICE if _profile_has_prompt_audio(profile_dir, "tsukasa-speech") else fallback
+    return resolved
+
+
+def _normalize_qwen_voice_choice(voice: str) -> str:
+    raw = voice.strip()
+    if is_custom_voice_choice(raw):
+        return CUSTOM_VOICE
+    return _canonical_qwen_voice(raw)
+
+
+def _resolve_profile_qwen_voice_choice(profile_dir: Path, voice: str, fallback: str = DEFAULT_QWEN_VOICE) -> str:
+    normalized = _normalize_qwen_voice_choice(voice)
+    if normalized == CUSTOM_VOICE:
+        return CUSTOM_VOICE if _profile_has_prompt_audio(profile_dir, "qwen3-tts") else fallback
+    return normalized or fallback
+
+
+def tsukasa_voice_choices(current_voice: str = "", base_url: str | None = None, *, include_custom: bool = False) -> list[tuple[str, str]]:
     live_voices = _fetch_tsukasa_voice_names(base_url=base_url)
     if live_voices:
         choices = [(voice, "Live Tsukasa voice from /voices. [Tsukasa]") for voice in live_voices]
@@ -128,20 +180,89 @@ def tsukasa_voice_choices(current_voice: str = "", base_url: str | None = None) 
             if "[Tsukasa]" in description
         ]
 
+    if include_custom:
+        choices.insert(0, (CUSTOM_VOICE, "Use profile japanese.wav when available, else fall back to the default Tsukasa voice. [Tsukasa]"))
+
     current_value = current_voice.strip()
     if current_value and all(name != current_value for name, _description in choices):
         choices.insert(0, (current_value, "Saved profile value not advertised by current Tsukasa service. [Tsukasa]"))
     return choices
 
 
-def qwen_voice_choices() -> list[str]:
-    return list(QWEN_VOICE_CHOICES.values())
+def qwen_voice_choices(*, include_custom: bool = False) -> list[str]:
+    choices = list(QWEN_VOICE_CHOICES.values())
+    if include_custom:
+        return [CUSTOM_VOICE, *choices]
+    return choices
 
 
 def _read_text_file(path: Path, fallback: str = "") -> str:
     if path.is_file():
         return path.read_text(encoding="utf-8").strip()
     return fallback
+
+
+def _audio_file_to_data_url(path: Path) -> str:
+    audio_bytes = path.read_bytes()
+    mime_type, _encoding = mimetypes.guess_type(path.name)
+    if not mime_type:
+        mime_type = "audio/wav"
+    encoded = base64.b64encode(audio_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _find_profile_prompt_audio_file(profile_dir: Path, stem: str) -> Path | None:
+    for suffix in PROFILE_TTS_PROMPT_AUDIO_SUFFIXES:
+        candidate = profile_dir / f"{stem}{suffix}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _transcribe_profile_prompt_audio(audio_path: Path, *, language: str | None = None) -> str:
+    import whisper_asr
+
+    whisper_asr.refresh_settings()
+    args = argparse.Namespace(
+        base_url=whisper_asr.ASR_BASE_URL,
+        api_key=whisper_asr.ASR_API_KEY,
+        model=whisper_asr.ASR_MODEL or whisper_asr.ASR_MODEL_FALLBACK,
+        language=language or "auto",
+        response_format="text",
+        temperature=0.0,
+        prompt=None,
+        word_timestamps=False,
+    )
+    prepared_audio = whisper_asr._prepared_audio_from_file(audio_path, whisper_asr.ASR_SAMPLE_RATE)
+    return str(whisper_asr.transcribe_http(args, prepared_audio)).strip()
+
+
+def _ensure_profile_prompt_text_file(profile_dir: Path, stem: str) -> None:
+    text_path = profile_dir / f"{stem}.txt"
+    if text_path.is_file():
+        return
+
+    audio_path = _find_profile_prompt_audio_file(profile_dir, stem)
+    if audio_path is None:
+        return
+
+    try:
+        transcript = _transcribe_profile_prompt_audio(
+            audio_path,
+            language=PROFILE_TTS_PROMPT_TEXT_LANGUAGE_HINTS.get(stem),
+        )
+    except Exception as exc:
+        logger.warning("Failed to auto-generate %s from %s: %s", text_path.name, audio_path.name, exc)
+        return
+
+    if transcript:
+        text_path.write_text(transcript + "\n", encoding="utf-8")
+
+
+def ensure_profile_tts_ref_text_by_name(profiles_dir: Path, profile: str) -> None:
+    profile_dir = profiles_dir / profile
+    for _backend, stem in PROFILE_TTS_PROMPT_TEXT_STEMS.items():
+        _ensure_profile_prompt_text_file(profile_dir, stem)
 
 
 COMMON_SYSTEM_PROMPT = _read_text_file(COMMON_INSTRUCTIONS_FILE)
@@ -164,6 +285,7 @@ class RuntimeSettings:
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
         self._version = 0
+        self._pending_greeting_reason: str | None = None
 
     def snapshot(self) -> tuple[str, list[str], str, str, str, str, str, int]:
         with self._lock:
@@ -178,6 +300,12 @@ class RuntimeSettings:
                 self._version,
             )
 
+    def consume_pending_greeting_reason(self) -> str | None:
+        with self._lock:
+            reason = self._pending_greeting_reason
+            self._pending_greeting_reason = None
+            return reason
+
     def update(
         self,
         profile: str,
@@ -187,6 +315,8 @@ class RuntimeSettings:
         voice: str,
         qwen_voice: str,
         tts_instructions: str,
+        *,
+        greeting_reason: str | None = None,
     ) -> tuple[str, list[str], str, str, str, str, str, int]:
         normalized = [tool for tool in self.gui_tool_names if tool in enabled_tools]
         with self._lock:
@@ -194,9 +324,11 @@ class RuntimeSettings:
             self.enabled_tools = normalized
             self.active_character_prompt = character_prompt.strip()
             self.active_instructions = instructions.strip()
-            self.active_voice = voice
-            self.active_qwen_voice = _canonical_qwen_voice(qwen_voice) or DEFAULT_QWEN_VOICE
+            profile_dir = self.profiles_dir / profile
+            self.active_voice = _resolve_profile_tsukasa_voice_choice(profile_dir, voice, DEFAULT_VOICE)
+            self.active_qwen_voice = _resolve_profile_qwen_voice_choice(profile_dir, qwen_voice, DEFAULT_QWEN_VOICE)
             self.active_tts_instructions = tts_instructions.strip()
+            self._pending_greeting_reason = str(greeting_reason or "").strip() or None
             self._version += 1
             return (
                 self.active_profile,
@@ -359,7 +491,7 @@ def _canonical_qwen_voice(voice: str) -> str:
 
 def _load_profile_voice_config(profile_dir: Path) -> dict[str, str]:
     config_path = _profile_voice_config_path(profile_dir)
-    legacy_qwen_voice = _canonical_qwen_voice(_read_text_file(_profile_qwen_voice_path(profile_dir), ""))
+    legacy_qwen_voice = _normalize_qwen_voice_choice(_read_text_file(_profile_qwen_voice_path(profile_dir), ""))
     if config_path.is_file():
         try:
             payload = json.loads(config_path.read_text(encoding="utf-8"))
@@ -367,7 +499,7 @@ def _load_profile_voice_config(profile_dir: Path) -> dict[str, str]:
             payload = {}
         if isinstance(payload, dict):
             voice = str(payload.get("voice") or "").strip()
-            qwen_voice = _canonical_qwen_voice(str(payload.get("qwen_voice") or "")) or legacy_qwen_voice
+            qwen_voice = _normalize_qwen_voice_choice(str(payload.get("qwen_voice") or "")) or legacy_qwen_voice
             tts_instructions = str(payload.get("tts_instructions") or "").strip()
             return {
                 "voice": voice,
@@ -378,17 +510,15 @@ def _load_profile_voice_config(profile_dir: Path) -> dict[str, str]:
     legacy_voice = _read_text_file(_profile_qwen_voice_path(profile_dir), "").strip()
     return {
         "voice": legacy_voice,
-        "qwen_voice": _canonical_qwen_voice(legacy_voice),
+        "qwen_voice": _normalize_qwen_voice_choice(legacy_voice),
         "tts_instructions": "",
     }
 
 
 def load_profile_voice_by_name(profiles_dir: Path, profile: str, fallback: str = DEFAULT_VOICE) -> str:
     profile_dir = profiles_dir / profile
-    voice = _load_profile_voice_config(profile_dir).get("voice", "").strip() or fallback
-    if voice:
-        return voice
-    return fallback
+    voice = _load_profile_voice_config(profile_dir).get("voice", "").strip()
+    return _resolve_profile_tsukasa_voice_choice(profile_dir, voice, fallback)
 
 
 def load_profile_tts_instructions_by_name(
@@ -404,12 +534,34 @@ def load_profile_tts_instructions_by_name(
 def load_profile_qwen_voice_by_name(profiles_dir: Path, profile: str, fallback: str = DEFAULT_QWEN_VOICE) -> str:
     profile_dir = profiles_dir / profile
     qwen_voice = _load_profile_voice_config(profile_dir).get("qwen_voice", "").strip()
-    return qwen_voice or fallback
+    return _resolve_profile_qwen_voice_choice(profile_dir, qwen_voice, fallback)
+
+
+def load_profile_tts_ref_audio_by_name(profiles_dir: Path, profile: str) -> str | dict[str, str] | None:
+    profile_dir = profiles_dir / profile
+    ref_audio: dict[str, str] = {}
+    for backend, stem in PROFILE_TTS_PROMPT_AUDIO_STEMS.items():
+        prompt_path = _find_profile_prompt_audio_file(profile_dir, stem)
+        if prompt_path is not None:
+            ref_audio[backend] = _audio_file_to_data_url(prompt_path)
+    return ref_audio or None
+
+
+def load_profile_tts_ref_text_by_name(profiles_dir: Path, profile: str) -> str | dict[str, str] | None:
+    profile_dir = profiles_dir / profile
+    ensure_profile_tts_ref_text_by_name(profiles_dir, profile)
+    ref_text: dict[str, str] = {}
+    for backend, stem in PROFILE_TTS_PROMPT_TEXT_STEMS.items():
+        prompt_text_path = profile_dir / f"{stem}.txt"
+        text = _read_text_file(prompt_text_path, "")
+        if text:
+            ref_text[backend] = text
+    return ref_text or None
 
 
 def build_tts_request_voice(voice: str, qwen_voice: str) -> str | dict[str, str]:
-    primary_voice = normalize_tsukasa_voice(voice)
-    normalized_qwen_voice = _canonical_qwen_voice(qwen_voice)
+    primary_voice = DEFAULT_VOICE if is_custom_voice_choice(voice) else normalize_tsukasa_voice(voice)
+    normalized_qwen_voice = DEFAULT_QWEN_VOICE if is_custom_voice_choice(qwen_voice) else _canonical_qwen_voice(qwen_voice)
     if primary_voice and normalized_qwen_voice:
         return {
             "tsukasa-speech": primary_voice,
@@ -436,7 +588,7 @@ def save_profile_definition(
     (profile_dir / "character.txt").write_text(character_prompt.strip() + "\n", encoding="utf-8")
     ordered_tools = [tool for tool in gui_tool_names if tool in selected_tools]
     (profile_dir / "tools.txt").write_text("\n".join(ordered_tools) + "\n", encoding="utf-8")
-    normalized_qwen_voice = _canonical_qwen_voice(qwen_voice or "") or _canonical_qwen_voice(voice) or existing_qwen_voice or DEFAULT_QWEN_VOICE
+    normalized_qwen_voice = _normalize_qwen_voice_choice(qwen_voice or "") or _canonical_qwen_voice(voice) or _normalize_qwen_voice_choice(existing_qwen_voice) or DEFAULT_QWEN_VOICE
     _profile_voice_config_path(profile_dir).write_text(
         json.dumps(
             {
@@ -450,6 +602,7 @@ def save_profile_definition(
         + "\n",
         encoding="utf-8",
     )
+    ensure_profile_tts_ref_text_by_name(profiles_dir, profile)
     return profile_dir
 
 

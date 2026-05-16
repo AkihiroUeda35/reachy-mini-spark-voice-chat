@@ -30,6 +30,9 @@ TTS_MODEL: str | None = None
 TTS_MODEL_FALLBACK = ""
 TTS_TASK_TYPE = ""
 TTS_LANGUAGE = ""
+TTS_TEMPERATURE: float | None = None
+TTS_ALPHA: float | None = None
+TTS_BETA: float | None = None
 TTS_SAMPLE_RATE = 24000
 TTS_USE_REALTIME_STREAMING = True
 TTS_INSTRUCTIONS = ""
@@ -40,7 +43,7 @@ OUT_PATH = OUT_DIR / "spark_voice_chat.wav"
 def refresh_settings() -> None:
     global CHAT_BASE_URL, CHAT_API_KEY, CHAT_MODEL, CHAT_MODEL_FALLBACK
     global TTS_BASE_URL, TTS_API_KEY, VOICE, TTS_MODEL, TTS_MODEL_FALLBACK
-    global TTS_TASK_TYPE, TTS_LANGUAGE, TTS_SAMPLE_RATE, TTS_USE_REALTIME_STREAMING
+    global TTS_TASK_TYPE, TTS_LANGUAGE, TTS_TEMPERATURE, TTS_ALPHA, TTS_BETA, TTS_SAMPLE_RATE, TTS_USE_REALTIME_STREAMING
     global TTS_INSTRUCTIONS, OUT_DIR, OUT_PATH
 
     CHAT_BASE_URL = service_url("llm", "http://localhost:8010/v1")
@@ -54,6 +57,12 @@ def refresh_settings() -> None:
     TTS_MODEL_FALLBACK = os.environ.get("TTS_MODEL_FALLBACK", "Respair/Tsukasa_Speech")
     TTS_TASK_TYPE = os.environ.get("TTS_TASK_TYPE", "CustomVoice")
     TTS_LANGUAGE = os.environ.get("TTS_LANGUAGE", "Japanese")
+    raw_tts_temperature = os.environ.get("TTS_TEMPERATURE", "").strip()
+    TTS_TEMPERATURE = float(raw_tts_temperature) if raw_tts_temperature else None
+    raw_tts_alpha = os.environ.get("TTS_ALPHA", "").strip()
+    TTS_ALPHA = float(raw_tts_alpha) if raw_tts_alpha else None
+    raw_tts_beta = os.environ.get("TTS_BETA", "").strip()
+    TTS_BETA = float(raw_tts_beta) if raw_tts_beta else None
     TTS_SAMPLE_RATE = int(os.environ.get("TTS_SAMPLE_RATE", "24000"))
     TTS_USE_REALTIME_STREAMING = os.environ.get("TTS_USE_REALTIME_STREAMING", "1") != "0"
     TTS_INSTRUCTIONS = os.environ.get(

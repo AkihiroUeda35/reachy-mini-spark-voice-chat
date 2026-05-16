@@ -122,6 +122,7 @@ services:
       TTS_DEFAULT_TASK_TYPE: ${TTS_DEFAULT_TASK_TYPE:-CustomVoice}
       TTS_DEFAULT_LANGUAGE: ${TTS_DEFAULT_LANGUAGE:-Japanese}
       TTS_DEFAULT_VOICE: ${TTS_DEFAULT_VOICE:-default}
+      TTS_TEMPERATURE: ${TTS_TEMPERATURE:-}
       QWEN_TTS_MODEL: ${QWEN_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}
       QWEN_TTS_VOICES_FILE: /workspace/tts/voices/voices.json
       TSUKASA_SPEECH_BASE_URL: ${TSUKASA_SPEECH_BASE_URL:-http://tsukasa-speech:5001}

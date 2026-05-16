@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import json
 import os
 import sys
@@ -8,7 +9,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -151,6 +152,48 @@ class TTSBackendSwitchTests(unittest.TestCase):
 
         self.assertEqual(payload["instructions"], "落ち着いて、でも少し楽しげに話してください。")
 
+    def test_tsukasa_payload_prefers_request_ref_audio_for_custom_voice(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TTS_BACKEND": "tsukasa-speech",
+            },
+            clear=False,
+        ):
+            request = VOICE_SERVER.SpeechRequest(
+                model="tts-1",
+                input="テストです",
+                voice="default",
+                ref_audio={"tsukasa-speech": "data:audio/wav;base64,QUJDRA=="},
+                language="Japanese",
+                stream=False,
+            )
+            payload = VOICE_SERVER._tsukasa_payload(request)
+
+        self.assertEqual(payload["voice"], "data:audio/wav;base64,QUJDRA==")
+
+    def test_tsukasa_payload_prefers_request_alpha_beta(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TTS_BACKEND": "tsukasa-speech",
+            },
+            clear=False,
+        ):
+            request = VOICE_SERVER.SpeechRequest(
+                model="tts-1",
+                input="テストです",
+                voice="default",
+                alpha=0.42,
+                beta=0.84,
+                language="Japanese",
+                stream=False,
+            )
+            payload = VOICE_SERVER._tsukasa_payload(request)
+
+        self.assertAlmostEqual(payload["alpha"], 0.42)
+        self.assertAlmostEqual(payload["beta"], 0.84)
+
     def test_tsukasa_payload_falls_back_to_default_voice(self) -> None:
         with patch.dict(
             os.environ,
@@ -193,6 +236,33 @@ class TTSBackendSwitchTests(unittest.TestCase):
             payload = VOICE_SERVER._tts_request_payload(request, response_format="wav", stream=False, backend="qwen3-tts")
 
         self.assertEqual(payload["model"], "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+
+    def test_qwen_request_uses_backend_specific_ref_audio_and_auto_base_mode(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TTS_BACKEND": "tsukasa-speech",
+                "QWEN_TTS_MODEL": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            },
+            clear=False,
+        ):
+            request = VOICE_SERVER.SpeechRequest(
+                model="tts-1",
+                input="Hello Reachy, this is an English test.",
+                voice={"tsukasa-speech": "captain", "qwen3-tts": "Ryan"},
+                ref_audio={"tsukasa-speech": "data:audio/wav;base64,AAAA", "qwen3-tts": "data:audio/wav;base64,BBBB"},
+                temperature=0.55,
+                language="English",
+                x_vector_only_mode=True,
+                stream=False,
+            )
+
+            payload = VOICE_SERVER._tts_request_payload(request, response_format="wav", stream=False, backend="qwen3-tts")
+
+        self.assertEqual(payload["task_type"], "Base")
+        self.assertEqual(payload["temperature"], 0.55)
+        self.assertEqual(payload["ref_audio"], "data:audio/wav;base64,BBBB")
+        self.assertTrue(payload["x_vector_only_mode"])
 
     def test_japanese_request_keeps_tsukasa_backend(self) -> None:
         with patch.dict(
@@ -277,6 +347,78 @@ class TTSBackendSwitchTests(unittest.TestCase):
         ):
             self.assertEqual(VOICE_SERVER._default_voice_for_backend("tsukasa-speech"), "shiki_fine05")
             self.assertEqual(VOICE_SERVER._default_voice_for_backend("qwen3-tts"), "ono_anna")
+
+    def test_tts_warmup_requests_cover_japanese_and_english_routes(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TTS_BACKEND": "tsukasa-speech",
+                "TSUKASA_SPEECH_DEFAULT_VOICE": "shiki_fine05",
+                "QWEN_TTS_DEFAULT_VOICE": "ono_anna",
+                "TTS_WARMUP_TEXT": "こんにちは。",
+                "TTS_WARMUP_ENGLISH_TEXT": "Hello.",
+            },
+            clear=False,
+        ):
+            requests = VOICE_SERVER._tts_warmup_requests()
+
+        self.assertEqual([(request.language, request.backend, request.voice) for request in requests], [
+            ("Japanese", "tsukasa-speech", "shiki_fine05"),
+            ("English", "qwen3-tts", "ono_anna"),
+        ])
+
+    def test_warmup_tts_upstream_runs_both_languages(self) -> None:
+        with patch.object(VOICE_SERVER, "_tts_health", AsyncMock(return_value=True)), patch.object(
+            VOICE_SERVER,
+            "_tts_complete_audio",
+            AsyncMock(return_value=b"RIFF"),
+        ) as complete_audio, patch.dict(
+            os.environ,
+            {
+                "TTS_BACKEND": "tsukasa-speech",
+                "TSUKASA_SPEECH_DEFAULT_VOICE": "shiki_fine05",
+                "QWEN_TTS_DEFAULT_VOICE": "ono_anna",
+                "TTS_WARMUP_TEXT": "こんにちは。",
+                "TTS_WARMUP_ENGLISH_TEXT": "Hello.",
+            },
+            clear=False,
+        ):
+            setattr(VOICE_SERVER, "_tts_warmup_state", "pending")
+            setattr(VOICE_SERVER, "_tts_warmup_error", None)
+            asyncio.run(VOICE_SERVER._warmup_tts_upstream())
+
+        self.assertEqual(complete_audio.await_count, 2)
+        calls = complete_audio.await_args_list
+        requests = [call.args[0] for call in calls]
+        self.assertEqual([(request.language, request.backend) for request in requests], [
+            ("Japanese", "tsukasa-speech"),
+            ("English", "qwen3-tts"),
+        ])
+        self.assertEqual(VOICE_SERVER._tts_warmup_state, "completed")
+
+    def test_health_is_not_ready_while_warmup_is_pending(self) -> None:
+        with patch.object(VOICE_SERVER, "_tts_health", AsyncMock(return_value=True)):
+            setattr(VOICE_SERVER, "_stt_warmup_state", "pending")
+            setattr(VOICE_SERVER, "_tts_warmup_state", "completed")
+            response = VOICE_SERVER.Response()
+            payload = asyncio.run(VOICE_SERVER.health(response))
+
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(payload["ready"])
+        self.assertEqual(payload["warmup"]["stt"], "pending")
+
+    def test_health_is_ready_after_warmups_complete(self) -> None:
+        with patch.object(VOICE_SERVER, "_tts_health", AsyncMock(return_value=True)):
+            setattr(VOICE_SERVER, "_stt_warmup_state", "completed")
+            setattr(VOICE_SERVER, "_tts_warmup_state", "completed")
+            setattr(VOICE_SERVER, "_stt_warmup_error", None)
+            setattr(VOICE_SERVER, "_tts_warmup_error", None)
+            response = VOICE_SERVER.Response()
+            payload = asyncio.run(VOICE_SERVER.health(response))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ready"])
+        self.assertEqual(payload["status"], "ok")
 
     def test_transcription_language_maps_to_english_tts_language(self) -> None:
         self.assertEqual(VOICE_SERVER._tts_language_from_transcription_language("en"), "English")

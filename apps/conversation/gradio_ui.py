@@ -11,7 +11,7 @@ from pathlib import Path
 import gradio as gr
 
 import reachy_conversation_tools
-from state import DEFAULT_CHARACTER_PROMPT, DEFAULT_QWEN_VOICE, DEFAULT_TTS_INSTRUCTIONS, DEFAULT_VOICE, RuntimeSettings, active_tools_for_profile, compose_system_prompt, list_profile_names, load_profile_character_prompt_by_name, load_profile_qwen_voice_by_name, load_profile_tts_instructions_by_name, load_profile_voice_by_name, normalize_profile_name, qwen_voice_choices, save_profile_definition, save_selected_profile_name, tsukasa_voice_choices
+from state import DEFAULT_CHARACTER_PROMPT, DEFAULT_QWEN_VOICE, DEFAULT_TTS_INSTRUCTIONS, DEFAULT_VOICE, RuntimeSettings, active_tools_for_profile, compose_system_prompt, list_profile_names, load_profile_character_prompt_by_name, load_profile_qwen_voice_by_name, load_profile_tts_instructions_by_name, load_profile_voice_by_name, normalize_profile_name, profile_has_prompt_audio_by_name, qwen_voice_choices, save_profile_definition, save_selected_profile_name, tsukasa_voice_choices
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -68,13 +68,26 @@ def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings)
     profile_names = list_profile_names(profiles_dir)
     initial_profile, initial_tools, initial_character_prompt, _initial_prompt, initial_voice, initial_qwen_voice, initial_tts_instructions, _initial_version = runtime_settings.snapshot()
     tsukasa_base_url = os.environ.get("TSUKASA_SPEECH_BASE_URL", "http://localhost:5001")
-    qwen_dropdown_choices = qwen_voice_choices()
+    qwen_dropdown_choices = qwen_voice_choices(include_custom=profile_has_prompt_audio_by_name(profiles_dir, initial_profile, "qwen3-tts"))
 
-    def tsukasa_dropdown_update(selected_voice: str):
-        dropdown_choices = [(f"{name} - {description}", name) for name, description in tsukasa_voice_choices(selected_voice, base_url=tsukasa_base_url)]
+    def tsukasa_dropdown_update(profile: str, selected_voice: str):
+        dropdown_choices = [
+            (f"{name} - {description}", name)
+            for name, description in tsukasa_voice_choices(
+                selected_voice,
+                base_url=tsukasa_base_url,
+                include_custom=profile_has_prompt_audio_by_name(profiles_dir, profile, "tsukasa-speech"),
+            )
+        ]
         return gr.update(choices=dropdown_choices, value=selected_voice)
 
-    def on_profile_change(profile: str) -> tuple[str, list[str], str, str, str, str]:
+    def qwen_dropdown_update(profile: str, selected_voice: str):
+        return gr.update(
+            choices=qwen_voice_choices(include_custom=profile_has_prompt_audio_by_name(profiles_dir, profile, "qwen3-tts")),
+            value=selected_voice,
+        )
+
+    def on_profile_change(profile: str):
         selected_profile = profile if profile in profile_names else initial_profile
         selected_tools = active_tools_for_profile(profiles_dir, selected_profile, GUI_TOOL_NAMES)
         character_prompt = load_profile_character_prompt_by_name(profiles_dir, selected_profile, DEFAULT_CHARACTER_PROMPT)
@@ -82,7 +95,7 @@ def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings)
         qwen_voice = load_profile_qwen_voice_by_name(profiles_dir, selected_profile, DEFAULT_QWEN_VOICE)
         tts_instructions = load_profile_tts_instructions_by_name(profiles_dir, selected_profile, DEFAULT_TTS_INSTRUCTIONS)
         status = f"Loaded character '{selected_profile}'. You can edit the character prompt, Tsukasa voice, Qwen voice, save, or apply live."
-        return character_prompt, selected_tools, tsukasa_dropdown_update(voice), qwen_voice, tts_instructions, status
+        return character_prompt, selected_tools, tsukasa_dropdown_update(selected_profile, voice), qwen_dropdown_update(selected_profile, qwen_voice), tts_instructions, status
 
     def on_apply(profile: str, character_prompt: str, selected_tools: list[str], voice: str, qwen_voice: str, tts_instructions: str) -> str:
         if profile not in profile_names:
@@ -95,6 +108,7 @@ def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings)
             voice,
             qwen_voice,
             tts_instructions,
+            greeting_reason="character update",
         )
         save_selected_profile_name(profiles_dir, active_profile)
         return (
@@ -106,7 +120,16 @@ def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings)
         if profile not in profile_names:
             return f"Unknown character '{profile}'. Create it first."
         profile_dir = save_profile_definition(profiles_dir, profile, character_prompt, selected_tools, voice, qwen_voice, tts_instructions, GUI_TOOL_NAMES)
-        runtime_settings.update(profile, selected_tools, character_prompt, compose_system_prompt(character_prompt), voice, qwen_voice, tts_instructions)
+        runtime_settings.update(
+            profile,
+            selected_tools,
+            character_prompt,
+            compose_system_prompt(character_prompt),
+            voice,
+            qwen_voice,
+            tts_instructions,
+            greeting_reason="character update",
+        )
         save_selected_profile_name(profiles_dir, profile)
         return f"Saved character '{profile}' to {profile_dir}."
 
@@ -155,8 +178,8 @@ def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings)
             gr.update(choices=profile_names, value=normalized_name),
             saved_character_prompt,
             saved_tools,
-            tsukasa_dropdown_update(saved_voice),
-            saved_qwen_voice,
+            tsukasa_dropdown_update(normalized_name, saved_voice),
+            qwen_dropdown_update(normalized_name, saved_qwen_voice),
             saved_tts_instructions,
             f"Created character '{normalized_name}' at {profile_dir}.",
             "",
@@ -174,7 +197,14 @@ def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings)
         character_box = gr.Textbox(label="Character Prompt", value=initial_character_prompt, lines=12, interactive=True)
         voice_dropdown = gr.Dropdown(
             label="Tsukasa Voice",
-            choices=[(f"{name} - {description}", name) for name, description in tsukasa_voice_choices(initial_voice, base_url=tsukasa_base_url)],
+            choices=[
+                (f"{name} - {description}", name)
+                for name, description in tsukasa_voice_choices(
+                    initial_voice,
+                    base_url=tsukasa_base_url,
+                    include_custom=profile_has_prompt_audio_by_name(profiles_dir, initial_profile, "tsukasa-speech"),
+                )
+            ],
             value=initial_voice,
             allow_custom_value=True,
         )

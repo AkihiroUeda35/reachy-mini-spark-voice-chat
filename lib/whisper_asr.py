@@ -211,14 +211,29 @@ def _resample_audio(audio: np.ndarray, source_rate: int, target_rate: int) -> np
     return np.interp(target_positions, source_positions, audio).astype(np.float32)
 
 
+def _decode_audio_file(audio_path: Path) -> tuple[np.ndarray, int]:
+    try:
+        audio, source_rate = sf.read(str(audio_path), dtype="float32")
+        return _mono_audio(audio), int(source_rate)
+    except RuntimeError:
+        from pydub import AudioSegment
+
+        segment = AudioSegment.from_file(str(audio_path))
+        samples = np.array(segment.get_array_of_samples(), dtype=np.float32)
+        if segment.channels > 1:
+            samples = samples.reshape((-1, segment.channels)).mean(axis=1)
+        scale = float(1 << max(1, (8 * segment.sample_width) - 1))
+        normalized = samples / scale
+        return normalized.astype(np.float32), int(segment.frame_rate)
+
+
 def _prepared_audio_from_file(audio_path: Path, sample_rate: int) -> PreparedAudio:
     if not audio_path.is_file():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
     file_bytes = audio_path.read_bytes()
     mime_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
-    audio, source_rate = sf.read(str(audio_path), dtype="float32")
-    mono_audio = _mono_audio(audio)
+    mono_audio, source_rate = _decode_audio_file(audio_path)
     normalized = _resample_audio(mono_audio, int(source_rate), sample_rate)
     return PreparedAudio(
         source_stem=audio_path.stem,

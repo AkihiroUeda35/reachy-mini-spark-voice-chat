@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib
 import io
 import logging
 import os
 import re
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
@@ -49,6 +51,15 @@ def _sample_rate() -> int:
 
 def _default_voice() -> str:
     return _env("TSUKASA_SPEECH_DEFAULT_VOICE", "audio_ref")
+
+
+def _prompt_style_blend() -> float:
+    raw = _env("TSUKASA_SPEECH_PROMPT_STYLE_BLEND", "0.2")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.2
+    return max(0.0, min(1.0, value))
 
 
 def _ensure_repo_available() -> Path:
@@ -102,8 +113,47 @@ def _voice_paths() -> list[Path]:
     return voices
 
 
-def _resolve_voice_path(voice: str | None) -> Path:
+def _supported_voice_suffix(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+
+
+def _materialize_voice_data_url(data_url: str, temp_dir: Path) -> Path:
+    try:
+        header, encoded = data_url.split(",", 1)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid Tsukasa voice data URL.") from exc
+    if ";base64" not in header:
+        raise HTTPException(status_code=400, detail="Tsukasa voice data URL must be base64-encoded.")
+    mime_type = header[5:].split(";", 1)[0] if header.startswith("data:") else "audio/wav"
+    suffix = {
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/mpeg": ".mp3",
+        "audio/flac": ".flac",
+        "audio/ogg": ".ogg",
+        "audio/mp4": ".m4a",
+        "audio/x-m4a": ".m4a",
+    }.get(mime_type, ".wav")
+    try:
+        audio_bytes = base64.b64decode(encoded)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid base64 Tsukasa voice data URL.") from exc
+    voice_path = temp_dir / f"prompt_voice{suffix}"
+    voice_path.write_bytes(audio_bytes)
+    return voice_path
+
+
+def _resolve_voice_path(voice: str | None, *, temp_dir: Path | None = None) -> Path:
     requested = (voice or "").strip() or _default_voice()
+    if requested.startswith("data:"):
+        if temp_dir is None:
+            raise HTTPException(status_code=400, detail="Custom Tsukasa voice data URL requires a temporary directory.")
+        return _materialize_voice_data_url(requested, temp_dir)
+
+    requested_path = Path(requested).expanduser()
+    if _supported_voice_suffix(requested_path):
+        return requested_path
+
     voices = _voice_paths()
     if requested.isdigit():
         index = int(requested)
@@ -138,6 +188,15 @@ def _wav_bytes(audio: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
+def _blend_voice_and_prompt_style(voice_style: Any, prompt_style: Any) -> Any:
+    prompt_blend = _prompt_style_blend()
+    if prompt_blend <= 0.0:
+        return voice_style
+    if prompt_blend >= 1.0:
+        return prompt_style
+    return ((1.0 - prompt_blend) * voice_style) + (prompt_blend * prompt_style)
+
+
 class SynthesizeRequest(BaseModel):
     text: str = Field(min_length=1)
     voice: str | None = None
@@ -154,39 +213,42 @@ def _synthesize_sync(req: SynthesizeRequest) -> bytes:
     runtime = _load_runtime()
     importable_module = runtime["importable"]
     smart_phonemize = runtime["smart_phonemize"]
-    voice_path = _resolve_voice_path(req.voice)
     phonemes = smart_phonemize(req.text.strip())
 
-    with _inference_lock:
-        voice_style = importable_module.compute_style_through_clip(str(voice_path))
-        if req.instructions.strip():
-            prompt_text = _prompt_text_for_style(importable_module, smart_phonemize, req.text)
-            prompt = f"{req.instructions.strip()}\ntext: {prompt_text}"
-            prompt_style = importable_module.Kotodama_Prompter(
-                importable_module.model,
-                text=prompt,
-                device=importable_module.device,
-            )
-            audio = importable_module.inference(
-                phonemes,
-                prompt_style,
-                alpha=req.alpha,
-                beta=req.beta,
-                diffusion_steps=req.diffusion_steps,
-                embedding_scale=req.embedding_scale,
-                rate_of_speech=req.speed,
-            )
-            audio = importable_module.trim_long_silences(audio)
-        else:
-            audio = importable_module.inference(
-                phonemes,
-                voice_style,
-                alpha=req.alpha,
-                beta=req.beta,
-                diffusion_steps=req.diffusion_steps,
-                embedding_scale=req.embedding_scale,
-                rate_of_speech=req.speed,
-            )
+    with tempfile.TemporaryDirectory(prefix="tsukasa-voice-") as temp_dir_name:
+        voice_path = _resolve_voice_path(req.voice, temp_dir=Path(temp_dir_name))
+
+        with _inference_lock:
+            voice_style = importable_module.compute_style_through_clip(str(voice_path))
+            if req.instructions.strip():
+                prompt_text = _prompt_text_for_style(importable_module, smart_phonemize, req.text)
+                prompt = f"{req.instructions.strip()}\ntext: {prompt_text}"
+                prompt_style = importable_module.Kotodama_Prompter(
+                    importable_module.model,
+                    text=prompt,
+                    device=importable_module.device,
+                )
+                style = _blend_voice_and_prompt_style(voice_style, prompt_style)
+                audio = importable_module.inference(
+                    phonemes,
+                    style,
+                    alpha=req.alpha,
+                    beta=req.beta,
+                    diffusion_steps=req.diffusion_steps,
+                    embedding_scale=req.embedding_scale,
+                    rate_of_speech=req.speed,
+                )
+                audio = importable_module.trim_long_silences(audio)
+            else:
+                audio = importable_module.inference(
+                    phonemes,
+                    voice_style,
+                    alpha=req.alpha,
+                    beta=req.beta,
+                    diffusion_steps=req.diffusion_steps,
+                    embedding_scale=req.embedding_scale,
+                    rate_of_speech=req.speed,
+                )
 
     return _wav_bytes(np.asarray(audio, dtype=np.float32))
 

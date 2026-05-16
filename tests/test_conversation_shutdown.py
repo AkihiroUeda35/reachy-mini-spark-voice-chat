@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 import signal
-import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from pipecat.frames.frames import OutputAudioRawFrame
+
 from gradio_ui import _free_gradio_port_if_same_uv_app, _is_same_conversation_app_process
-from main import conversation_loop, is_recoverable_llm_turn_error
-from pipeline import _create_turn_pipeline_runner
+from main import _play_assistant_text, capture_robot_utterance, conversation_loop, is_recoverable_llm_turn_error
+from pipeline import SpeechInterruptedError, _create_turn_pipeline_runner
+from state import RuntimeSettings as StateRuntimeSettings
 
 
 class ConversationShutdownTests(unittest.TestCase):
@@ -32,6 +33,7 @@ class ConversationShutdownTests(unittest.TestCase):
             tts_api_key="test-key",
             tts_model="tts-test",
             robot_name=None,
+            robot_host="reachy-mini.local",
             data_dir="/tmp/conversation-test-data",
             assistant_speaking_tail_ms=350,
             gradio=False,
@@ -126,6 +128,26 @@ class ConversationShutdownTests(unittest.TestCase):
         robot.wake_up.assert_not_called()
         speak_greeting.assert_awaited_once()
 
+    def test_conversation_loop_passes_robot_host_to_reachymini(self) -> None:
+        args = self._make_args(wake_up=False)
+        args.robot_host = "192.168.0.42"
+        robot = self._make_robot()
+        runtime = MagicMock()
+        runtime.shutdown = AsyncMock()
+        speak_greeting = AsyncMock(return_value=[])
+
+        with (
+            patch("main.resolve_runtime_models"),
+            patch("main.ReachyMini", return_value=robot) as reachy_cls,
+            patch("main.reachy_tools.ReachyToolRuntime", return_value=runtime),
+            patch("main._speak_persona_greeting", speak_greeting),
+            patch("main.capture_robot_utterance", side_effect=KeyboardInterrupt),
+        ):
+            result = asyncio.run(conversation_loop(args))
+
+        self.assertEqual(result, 0)
+        reachy_cls.assert_called_once_with(host="192.168.0.42")
+
     def test_conversation_loop_greets_on_startup(self) -> None:
         args = self._make_args(wake_up=False)
         robot = self._make_robot()
@@ -146,6 +168,53 @@ class ConversationShutdownTests(unittest.TestCase):
         self.assertEqual(speak_greeting.await_count, 1)
         self.assertEqual(speak_greeting.await_args.kwargs["reason"], "startup")
 
+    def test_conversation_loop_recovers_when_startup_greeting_is_interrupted(self) -> None:
+        args = self._make_args(wake_up=False)
+        robot = self._make_robot()
+        runtime = MagicMock()
+        runtime.shutdown = AsyncMock()
+        created_settings: dict[str, StateRuntimeSettings] = {}
+
+        def make_runtime_settings(*args, **kwargs):
+            settings = StateRuntimeSettings(*args, **kwargs)
+            created_settings["value"] = settings
+            return settings
+
+        async def speak_greeting_side_effect(*_args, **kwargs):
+            reason = kwargs["reason"]
+            if reason == "startup":
+                settings = created_settings["value"]
+                profile, tools, character, instructions, _voice, qwen_voice, tts_instructions, _version = settings.snapshot()
+                settings.update(
+                    profile,
+                    tools,
+                    character,
+                    instructions,
+                    "audio_ref",
+                    qwen_voice,
+                    tts_instructions,
+                    greeting_reason="character update",
+                )
+                raise SpeechInterruptedError("assistant speech interrupted by live settings change")
+            return []
+
+        speak_greeting = AsyncMock(side_effect=speak_greeting_side_effect)
+
+        with (
+            patch("main.resolve_runtime_models"),
+            patch("main.ReachyMini", return_value=robot),
+            patch("main.RuntimeSettings", side_effect=make_runtime_settings),
+            patch("main.reachy_tools.ReachyToolRuntime", return_value=runtime),
+            patch("main._speak_persona_greeting", speak_greeting),
+            patch("main.capture_robot_utterance", side_effect=KeyboardInterrupt),
+        ):
+            result = asyncio.run(conversation_loop(args))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(speak_greeting.await_count, 2)
+        self.assertEqual(speak_greeting.await_args_list[0].kwargs["reason"], "startup")
+        self.assertEqual(speak_greeting.await_args_list[1].kwargs["reason"], "character update")
+
     def test_conversation_loop_greets_when_persona_changes(self) -> None:
         args = self._make_args(wake_up=False)
         robot = self._make_robot()
@@ -156,10 +225,7 @@ class ConversationShutdownTests(unittest.TestCase):
             [{"role": "assistant", "content": "拙者が参った。"}],
         ])
         runtime_settings = MagicMock()
-        runtime_settings.snapshot.side_effect = [
-            ("samurai", [], "Be stoic.", "You are stoic.", "Sohee", "Be concise.", 1),
-            ("samurai", [], "Be stoic.", "You are stoic.", "Sohee", "Be concise.", 1),
-        ]
+        runtime_settings.snapshot.return_value = ("samurai", [], "Be stoic.", "You are stoic.", "Sohee", "Ono_Anna", "Be concise.", 1)
 
         with (
             patch("main.resolve_runtime_models"),
@@ -183,13 +249,15 @@ class ConversationShutdownTests(unittest.TestCase):
         runtime.shutdown = AsyncMock()
         speak_greeting = AsyncMock(side_effect=[
             [{"role": "assistant", "content": "こんにちは。"}],
+            [{"role": "assistant", "content": "どうぞ。"}],
             [{"role": "assistant", "content": "拙者が参った。"}],
         ])
         runtime_settings = MagicMock()
         runtime_settings.snapshot.side_effect = [
-            ("default", [], "Be helpful.", "You are helpful.", "Sohee", "Be concise.", 0),
-            ("samurai", [], "Be stoic.", "You are stoic.", "Sohee", "Be concise.", 1),
-            ("samurai", [], "Be stoic.", "You are stoic.", "Sohee", "Be concise.", 1),
+            ("default", [], "Be helpful.", "You are helpful.", "Sohee", "Ono_Anna", "Be concise.", 0),
+            ("default", [], "Be helpful.", "You are helpful.", "Sohee", "Ono_Anna", "Be concise.", 0),
+            ("samurai", [], "Be stoic.", "You are stoic.", "Sohee", "Ono_Anna", "Be concise.", 1),
+            ("samurai", [], "Be stoic.", "You are stoic.", "Sohee", "Ono_Anna", "Be concise.", 1),
         ]
         transcribe_audio = AsyncMock()
         run_turn = AsyncMock()
@@ -209,8 +277,182 @@ class ConversationShutdownTests(unittest.TestCase):
         self.assertEqual(result, 0)
         transcribe_audio.assert_not_awaited()
         run_turn.assert_not_awaited()
+        self.assertEqual(speak_greeting.await_count, 3)
+        self.assertEqual(speak_greeting.await_args_list[-1].kwargs["reason"], "persona switch")
+
+    def test_conversation_loop_greets_after_live_voice_update(self) -> None:
+        args = self._make_args(wake_up=False)
+        robot = self._make_robot()
+        runtime = MagicMock()
+        runtime.shutdown = AsyncMock()
+        speak_greeting = AsyncMock(side_effect=[
+            [{"role": "assistant", "content": "こんにちは。"}],
+            [{"role": "assistant", "content": "声を変えました。"}],
+        ])
+        created_settings: dict[str, StateRuntimeSettings] = {}
+
+        def make_runtime_settings(*args, **kwargs):
+            settings = StateRuntimeSettings(*args, **kwargs)
+            created_settings["value"] = settings
+            return settings
+
+        async def capture_side_effect(*_args, **_kwargs):
+            if "updated" not in created_settings:
+                settings = created_settings["value"]
+                profile, tools, character, instructions, voice, qwen_voice, tts_instructions, _version = settings.snapshot()
+                next_voice = "audio_ref" if voice != "audio_ref" else "kaede_san"
+                settings.update(
+                    profile,
+                    tools,
+                    character,
+                    instructions,
+                    next_voice,
+                    qwen_voice,
+                    tts_instructions,
+                    greeting_reason="character update",
+                )
+                created_settings["updated"] = settings
+                return None
+            raise KeyboardInterrupt
+
+        with (
+            patch("main.resolve_runtime_models"),
+            patch("main.ReachyMini", return_value=robot),
+            patch("main.RuntimeSettings", side_effect=make_runtime_settings),
+            patch("main.reachy_tools.ReachyToolRuntime", return_value=runtime),
+            patch("main._speak_persona_greeting", speak_greeting),
+            patch("main.capture_robot_utterance", side_effect=capture_side_effect),
+        ):
+            result = asyncio.run(conversation_loop(args))
+
+        self.assertEqual(result, 0)
         self.assertEqual(speak_greeting.await_count, 2)
-        self.assertEqual(speak_greeting.await_args_list[1].kwargs["reason"], "persona switch")
+        self.assertEqual(speak_greeting.await_args_list[0].kwargs["reason"], "startup")
+        self.assertEqual(speak_greeting.await_args_list[1].kwargs["reason"], "character update")
+
+    def test_capture_robot_utterance_aborts_wait_when_live_settings_change(self) -> None:
+        args = argparse.Namespace(
+            audio_poll_interval_ms=1.0,
+            listen_timeout_seconds=20.0,
+            vad_threshold=0.02,
+            vad_start_ms=150,
+            vad_end_ms=250,
+            vad_preroll_ms=150,
+            vad_max_seconds=5.0,
+            assistant_speaking_threshold_boost=0.005,
+            assistant_speaking_vad_start_ms=400,
+            assistant_speaking_min_vad_ms=500,
+            sample_rate=16000,
+        )
+        robot = MagicMock()
+        robot.media = MagicMock()
+        robot.media.get_input_audio_samplerate.return_value = 16000
+        robot.media.get_audio_sample.return_value = None
+        runtime_settings = MagicMock()
+        runtime_settings.snapshot.side_effect = [
+            ("default", [], "", "", "default", "Ono_Anna", "", 0),
+            ("default", [], "", "", "default", "Ono_Anna", "", 1),
+        ]
+
+        utterance = asyncio.run(
+            capture_robot_utterance(
+                robot,
+                args,
+                runtime_settings=runtime_settings,
+                expected_settings_version=0,
+            )
+        )
+
+        self.assertIsNone(utterance)
+
+    def test_play_assistant_text_interrupts_when_live_settings_change(self) -> None:
+        args = argparse.Namespace(
+            tts_transport="http",
+            head_wobble=False,
+            tts_sample_rate=24000,
+        )
+        robot = self._make_robot()
+        runtime_settings = MagicMock()
+        runtime_settings.snapshot.side_effect = [
+            ("default", [], "", "", "default", "Ono_Anna", "", 0),
+            ("default", [], "", "", "default", "Ono_Anna", "", 1),
+        ]
+        audio_player = MagicMock()
+        audio_player.process_frame = AsyncMock()
+
+        async def fake_audio_stream(_args, _text):
+            yield OutputAudioRawFrame(audio=b"\x00\x00" * 32, sample_rate=24000, num_channels=1)
+            yield OutputAudioRawFrame(audio=b"\x00\x00" * 32, sample_rate=24000, num_channels=1)
+
+        with (
+            patch("main.ReachyAudioPlayer", return_value=audio_player),
+            patch("main.synthesize_audio_stream", fake_audio_stream),
+        ):
+            with self.assertRaises(SpeechInterruptedError):
+                asyncio.run(
+                    _play_assistant_text(
+                        args,
+                        robot,
+                        "こんにちは。",
+                        runtime_settings=runtime_settings,
+                        expected_settings_version=0,
+                    )
+                )
+
+        audio_player.abort.assert_called_once_with()
+        audio_player.close.assert_called_once_with()
+        self.assertEqual(audio_player.process_frame.await_count, 1)
+
+    def test_conversation_loop_discards_live_reply_when_settings_change(self) -> None:
+        args = self._make_args(wake_up=False)
+        robot = self._make_robot()
+        runtime = MagicMock()
+        runtime.shutdown = AsyncMock()
+        speak_greeting = AsyncMock(side_effect=[
+            [{"role": "assistant", "content": "こんにちは。"}],
+            [{"role": "assistant", "content": "声を変えました。"}],
+        ])
+        run_turn = AsyncMock(side_effect=[SpeechInterruptedError("interrupted"), KeyboardInterrupt])
+        created_settings: dict[str, StateRuntimeSettings] = {}
+
+        def make_runtime_settings(*args, **kwargs):
+            settings = StateRuntimeSettings(*args, **kwargs)
+            created_settings["value"] = settings
+            return settings
+
+        async def capture_side_effect(*_args, **_kwargs):
+            settings = created_settings["value"]
+            if "updated" not in created_settings:
+                profile, tools, character, instructions, voice, qwen_voice, tts_instructions, _version = settings.snapshot()
+                settings.update(
+                    profile,
+                    tools,
+                    character,
+                    instructions,
+                    voice,
+                    qwen_voice,
+                    tts_instructions,
+                    greeting_reason="character update",
+                )
+                created_settings["updated"] = True
+                return MagicMock(overlap_gate_active=False, duration_ms=800.0)
+            raise KeyboardInterrupt
+
+        with (
+            patch("main.resolve_runtime_models"),
+            patch("main.ReachyMini", return_value=robot),
+            patch("main.RuntimeSettings", side_effect=make_runtime_settings),
+            patch("main.reachy_tools.ReachyToolRuntime", return_value=runtime),
+            patch("main._speak_persona_greeting", speak_greeting),
+            patch("main.capture_robot_utterance", side_effect=capture_side_effect),
+            patch("main.transcribe_captured_audio", AsyncMock(return_value={"text": "ねえ", "segments": []})),
+            patch("main.run_pipeline", run_turn),
+        ):
+            result = asyncio.run(conversation_loop(args))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(speak_greeting.await_count, 2)
+        self.assertEqual(speak_greeting.await_args_list[-1].kwargs["reason"], "character update")
 
 
 if __name__ == "__main__":

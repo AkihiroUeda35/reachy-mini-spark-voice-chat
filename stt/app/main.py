@@ -28,6 +28,10 @@ _stt_model: WhisperModel | None = None
 _stt_lock = threading.Lock()
 _stt_warmup_task: asyncio.Task[None] | None = None
 _tts_warmup_task: asyncio.Task[None] | None = None
+_stt_warmup_state: Literal["not_started", "pending", "completed", "failed", "disabled"] = "not_started"
+_tts_warmup_state: Literal["not_started", "pending", "completed", "failed", "disabled"] = "not_started"
+_stt_warmup_error: str | None = None
+_tts_warmup_error: str | None = None
 
 logger = logging.getLogger("tts")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -70,6 +74,13 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
+def _env_text(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip()
+
+
 def _stt_default_language() -> str | None:
     value = os.environ.get("STT_DEFAULT_LANGUAGE", "").strip()
     if not value or value.lower() == "auto":
@@ -104,12 +115,23 @@ def _stt_public_model_name() -> str:
 @app.on_event("startup")
 async def startup_event() -> None:
     global _stt_warmup_started, _stt_warmup_task, _tts_warmup_started, _tts_warmup_task
+    global _stt_warmup_state, _tts_warmup_state, _stt_warmup_error, _tts_warmup_error
     if not _stt_warmup_started:
         _stt_warmup_started = True
-        _stt_warmup_task = asyncio.create_task(_warmup_stt_model())
+        _stt_warmup_error = None
+        if _stt_warmup_enabled():
+            _stt_warmup_state = "pending"
+            _stt_warmup_task = asyncio.create_task(_warmup_stt_model())
+        else:
+            _stt_warmup_state = "disabled"
     if not _tts_warmup_started:
         _tts_warmup_started = True
-        _tts_warmup_task = asyncio.create_task(_warmup_tts_upstream())
+        _tts_warmup_error = None
+        if _tts_warmup_enabled():
+            _tts_warmup_state = "pending"
+            _tts_warmup_task = asyncio.create_task(_warmup_tts_upstream())
+        else:
+            _tts_warmup_state = "disabled"
 
 
 @app.on_event("shutdown")
@@ -293,6 +315,24 @@ def _normalize_voice_for_backend(voice: str | dict[str, str], backend: str) -> s
     return _qwen_default_voice()
 
 
+def _backend_str_value(value: str | dict[str, str] | None, backend: str) -> str | None:
+    if isinstance(value, dict):
+        candidates = [
+            value.get(backend),
+            value.get("qwen3-tts" if backend == "qwen3-tts" else "tsukasa-speech"),
+            value.get("qwen" if backend == "qwen3-tts" else "tsukasa"),
+            value.get("default"),
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return None
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    return None
+
+
 def _tsukasa_base_url() -> str:
     return _env("TSUKASA_SPEECH_BASE_URL", "http://tsukasa-speech:5001").rstrip("/")
 
@@ -425,7 +465,11 @@ def _tts_warmup_enabled() -> bool:
 
 
 def _tts_warmup_text() -> str:
-    return _env("TTS_WARMUP_TEXT", "こんにちは。")
+    return _env_text("TTS_WARMUP_TEXT", "こんにちは。")
+
+
+def _tts_warmup_english_text() -> str:
+    return _env_text("TTS_WARMUP_ENGLISH_TEXT", "Hello.")
 
 
 def _default_task_type() -> Literal["CustomVoice", "VoiceDesign", "Base"]:
@@ -433,6 +477,19 @@ def _default_task_type() -> Literal["CustomVoice", "VoiceDesign", "Base"]:
     if task_type not in {"CustomVoice", "VoiceDesign", "Base"}:
         task_type = "CustomVoice"
     return cast(Literal["CustomVoice", "VoiceDesign", "Base"], task_type)
+
+
+def _warmup_ready() -> bool:
+    return _stt_warmup_state in {"completed", "disabled"} and _tts_warmup_state in {"completed", "disabled"}
+
+
+def _warmup_errors() -> dict[str, str]:
+    errors: dict[str, str] = {}
+    if _stt_warmup_error:
+        errors["stt"] = _stt_warmup_error
+    if _tts_warmup_error:
+        errors["tts"] = _tts_warmup_error
+    return errors
 
 
 def _to_pcm16(audio: np.ndarray) -> bytes:
@@ -722,8 +779,10 @@ def _tsukasa_voice_settings(req: "SpeechRequest") -> dict[str, Any]:
     voice_name_or_id = _voice_name(normalized_voice)
     voice_cfg = _voice_config(voice_name_or_id)
     requested_voice = normalized_voice if isinstance(normalized_voice, str) else ""
+    explicit_ref_audio = _backend_str_value(req.ref_audio, "tsukasa-speech") or ""
     ref_audio = str(
-        voice_cfg.get("voice_ref")
+        explicit_ref_audio
+        or voice_cfg.get("voice_ref")
         or voice_cfg.get("reference_wav")
         or voice_cfg.get("reference_audio")
         or voice_cfg.get("ref_audio")
@@ -736,14 +795,16 @@ def _tsukasa_voice_settings(req: "SpeechRequest") -> dict[str, Any]:
         or requested_voice
         or _tsukasa_default_voice()
     ).strip()
-    if not voice_name and ref_audio:
+    if explicit_ref_audio:
+        voice_name = explicit_ref_audio
+    elif not voice_name and ref_audio:
         voice_name = Path(ref_audio).stem
     return {
         "voice": voice_name or _tsukasa_default_voice(),
         "diffusion_steps": int(voice_cfg.get("diffusion_steps", _tsukasa_default_diffusion_steps())),
         "embedding_scale": float(voice_cfg.get("embedding_scale", _tsukasa_default_embedding_scale())),
-        "alpha": float(voice_cfg.get("alpha", _tsukasa_default_alpha())),
-        "beta": float(voice_cfg.get("beta", _tsukasa_default_beta())),
+        "alpha": float(req.alpha if req.alpha is not None else voice_cfg.get("alpha", _tsukasa_default_alpha())),
+        "beta": float(req.beta if req.beta is not None else voice_cfg.get("beta", _tsukasa_default_beta())),
     }
 
 
@@ -890,12 +951,15 @@ class SpeechRequest(BaseModel):
     response_format: str = "wav"
     stream_format: Literal["audio", "sse"] = "audio"
     speed: float = 1.0
+    temperature: float | None = None
+    alpha: float | None = None
+    beta: float | None = None
     stream: bool = True
     chunk_size: int | None = Field(default=None, ge=1)
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] = Field(default_factory=_default_task_type)
     language: str = Field(default_factory=lambda: _env("TTS_DEFAULT_LANGUAGE", _env("QWEN_TTS_DEFAULT_LANGUAGE", "Japanese")))
-    ref_audio: str | None = None
-    ref_text: str | None = None
+    ref_audio: str | dict[str, str] | None = None
+    ref_text: str | dict[str, str] | None = None
     x_vector_only_mode: bool = False
     max_new_tokens: int | None = Field(default=None, ge=1)
 
@@ -906,8 +970,14 @@ class RealtimeSession(BaseModel):
     voice: str | dict[str, str] = Field(default_factory=lambda: _env("TTS_DEFAULT_VOICE", _env("QWEN_TTS_DEFAULT_VOICE", "Ono_Anna")))
     instructions: str = ""
     input_text: str = ""
+    temperature: float | None = None
+    alpha: float | None = None
+    beta: float | None = None
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] = Field(default_factory=_default_task_type)
     language: str = Field(default_factory=lambda: _env("TTS_DEFAULT_LANGUAGE", _env("QWEN_TTS_DEFAULT_LANGUAGE", "Japanese")))
+    ref_audio: str | dict[str, str] | None = None
+    ref_text: str | dict[str, str] | None = None
+    x_vector_only_mode: bool = False
     transcription_model: str = Field(default_factory=_stt_public_model_name)
     input_audio_transcription: bool = False
     input_audio_format: Literal["pcm16", "wav"] = "pcm16"
@@ -927,6 +997,11 @@ def _tts_request_payload(
 ) -> dict[str, Any]:
     use_stream = req.stream if stream is None else stream
     target_backend = backend or _tts_backend_for_request(req)
+    ref_audio = _backend_str_value(req.ref_audio, target_backend)
+    ref_text = _backend_str_value(req.ref_text, target_backend) or ""
+    effective_task_type = req.task_type
+    if target_backend == "qwen3-tts" and ref_audio and effective_task_type != "VoiceDesign":
+        effective_task_type = "Base"
     payload: dict[str, Any] = {
         "input": req.input,
         "response_format": response_format or req.response_format.lower(),
@@ -938,9 +1013,11 @@ def _tts_request_payload(
         payload["stream"] = True
     elif req.speed != 1.0:
         payload["speed"] = req.speed
+    if req.temperature is not None:
+        payload["temperature"] = req.temperature
 
-    if req.task_type:
-        payload["task_type"] = req.task_type
+    if effective_task_type:
+        payload["task_type"] = effective_task_type
     if req.language.strip():
         payload["language"] = req.language.strip()
     if req.instructions.strip():
@@ -949,12 +1026,10 @@ def _tts_request_payload(
         payload["max_new_tokens"] = req.max_new_tokens
 
     voice_name = _voice_name(_normalize_voice_for_backend(req.voice, target_backend))
-    if req.task_type != "VoiceDesign" and voice_name:
+    if effective_task_type != "VoiceDesign" and voice_name:
         payload["voice"] = voice_name
 
-    if req.task_type == "Base":
-        ref_audio = req.ref_audio
-        ref_text = req.ref_text or ""
+    if effective_task_type == "Base":
         if not ref_audio:
             voice_cfg = _voice_config(voice_name)
             ref_audio = voice_cfg.get("ref_audio")
@@ -985,21 +1060,63 @@ async def _tts_health() -> bool:
 
 
 async def _warmup_stt_model() -> None:
+    global _stt_warmup_state, _stt_warmup_error
     if not _stt_warmup_enabled():
+        _stt_warmup_state = "disabled"
         logger.info("STT warmup disabled")
         return
 
     logger.info("Starting STT warmup in background")
-
     try:
         await asyncio.to_thread(get_stt_model)
+        _stt_warmup_state = "completed"
+        _stt_warmup_error = None
         logger.info("STT warmup completed")
     except Exception as exc:
+        _stt_warmup_state = "failed"
+        _stt_warmup_error = str(exc)
         logger.warning("STT warmup failed: %s", exc)
 
 
+def _tts_warmup_requests() -> list["SpeechRequest"]:
+    warmup_specs = [
+        ("Japanese", _tts_warmup_text()),
+        ("English", _tts_warmup_english_text()),
+    ]
+    requests: list[SpeechRequest] = []
+    for language, text in warmup_specs:
+        prompt = text.strip()
+        if not prompt:
+            continue
+        probe_request = SpeechRequest(
+            model=_tts_public_model_name(),
+            input=prompt,
+            voice="default",
+            task_type=_default_task_type(),
+            language=language,
+            response_format="wav",
+            stream=False,
+        )
+        target_backend = _tts_backend_for_request(probe_request)
+        requests.append(
+            SpeechRequest(
+                model=_tts_public_model_name(),
+                input=prompt,
+                backend=target_backend,
+                voice=_default_voice_for_backend(target_backend),
+                task_type=_default_task_type(),
+                language=language,
+                response_format="wav",
+                stream=False,
+            )
+        )
+    return requests
+
+
 async def _warmup_tts_upstream() -> None:
+    global _tts_warmup_state, _tts_warmup_error
     if not _tts_warmup_enabled():
+        _tts_warmup_state = "disabled"
         logger.info("TTS upstream warmup disabled")
         return
 
@@ -1010,25 +1127,24 @@ async def _warmup_tts_upstream() -> None:
             break
         await asyncio.sleep(2)
     else:
+        _tts_warmup_state = "failed"
+        _tts_warmup_error = "Upstream health never became ready"
         logger.warning("TTS upstream warmup skipped because upstream health never became ready")
         return
 
     try:
-        backend = _tts_backend()
-        await _tts_complete_audio(
-            SpeechRequest(
-                model=_tts_public_model_name(),
-                input=_tts_warmup_text(),
-                voice=_default_voice_for_backend(backend),
-                task_type=_default_task_type(),
-                language=_env("TTS_DEFAULT_LANGUAGE", _env("QWEN_TTS_DEFAULT_LANGUAGE", "Japanese")),
-                response_format="wav",
-                stream=False,
-            ),
-            response_format="wav",
-        )
+        for request in _tts_warmup_requests():
+            await _tts_complete_audio(request, response_format="wav")
+        _tts_warmup_state = "completed"
+        _tts_warmup_error = None
         logger.info("TTS upstream warmup completed")
     except HTTPException as exc:
+        _tts_warmup_state = "failed"
+        _tts_warmup_error = str(exc.detail)
+        logger.warning("TTS upstream warmup failed: %s", exc)
+    except Exception as exc:
+        _tts_warmup_state = "failed"
+        _tts_warmup_error = str(exc)
         logger.warning("TTS upstream warmup failed: %s", exc)
 
 
@@ -1097,9 +1213,13 @@ async def _tts_stream_audio(req: "SpeechRequest") -> AsyncGenerator[bytes, None]
 
 
 @app.get("/health")
-async def health():
+async def health(response: Response):
+    tts_upstream_healthy = await _tts_health()
+    ready = _warmup_ready() and tts_upstream_healthy
+    response.status_code = 200 if ready else 503
     return {
-        "status": "ok",
+        "status": "ok" if ready else "starting",
+        "ready": ready,
         "tts_backend": _tts_backend(),
         "stt_model_loaded": _stt_model is not None,
         "stt_model": _stt_model_name(),
@@ -1107,7 +1227,12 @@ async def health():
         "tts_upstream_backend": _tts_upstream_base_url(),
         "tts_upstream_model": _tts_upstream_model_name(),
         "tts_public_model": _tts_public_model_name(),
-        "tts_upstream_healthy": await _tts_health(),
+        "tts_upstream_healthy": tts_upstream_healthy,
+        "warmup": {
+            "stt": _stt_warmup_state,
+            "tts": _tts_warmup_state,
+        },
+        "warmup_errors": _warmup_errors(),
     }
 
 
@@ -1325,8 +1450,39 @@ async def realtime_socket(websocket: WebSocket):
                     }
                     if voice_map:
                         session.voice = voice_map
+                if isinstance(payload.get("ref_audio"), str) and payload["ref_audio"].strip():
+                    session.ref_audio = payload["ref_audio"].strip()
+                elif isinstance(payload.get("ref_audio"), dict):
+                    ref_audio_map = {
+                        key.strip(): value.strip()
+                        for key, value in payload["ref_audio"].items()
+                        if isinstance(key, str) and key.strip() and isinstance(value, str) and value.strip()
+                    }
+                    if ref_audio_map:
+                        session.ref_audio = ref_audio_map
+                if isinstance(payload.get("ref_text"), str) and payload["ref_text"].strip():
+                    session.ref_text = payload["ref_text"].strip()
+                elif isinstance(payload.get("ref_text"), dict):
+                    ref_text_map = {
+                        key.strip(): value.strip()
+                        for key, value in payload["ref_text"].items()
+                        if isinstance(key, str) and key.strip() and isinstance(value, str) and value.strip()
+                    }
+                    if ref_text_map:
+                        session.ref_text = ref_text_map
+                if isinstance(payload.get("x_vector_only_mode"), bool):
+                    session.x_vector_only_mode = payload["x_vector_only_mode"]
                 if isinstance(payload.get("instructions"), str):
                     session.instructions = payload["instructions"]
+                temperature = payload.get("temperature")
+                if isinstance(temperature, (int, float)):
+                    session.temperature = float(temperature)
+                alpha = payload.get("alpha")
+                if isinstance(alpha, (int, float)):
+                    session.alpha = float(alpha)
+                beta = payload.get("beta")
+                if isinstance(beta, (int, float)):
+                    session.beta = float(beta)
                 if isinstance(payload.get("task_type"), str) and payload["task_type"] in {"CustomVoice", "VoiceDesign", "Base"}:
                     session.task_type = payload["task_type"]
                 if isinstance(payload.get("language"), str) and payload["language"].strip():
@@ -1641,10 +1797,16 @@ async def realtime_socket(websocket: WebSocket):
                     backend=session.backend,
                     voice=session.voice,
                     instructions=session.instructions,
+                    temperature=session.temperature,
+                    alpha=session.alpha,
+                    beta=session.beta,
                     response_format="pcm",
                     stream=True,
                     task_type=session.task_type,
                     language=session.language,
+                    ref_audio=session.ref_audio,
+                    ref_text=session.ref_text,
+                    x_vector_only_mode=session.x_vector_only_mode,
                 )
 
                 try:

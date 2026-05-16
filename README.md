@@ -112,6 +112,8 @@ Wrapper health:
 curl http://localhost:8020/health
 ```
 
+`voice-server` returns `503` from `/health` until its startup STT/TTS warmups finish, so the endpoint can be used as a readiness check instead of only a liveness check.
+
 ## Local Sample
 
 The sample script in [samples/langchain_openai_tts.py](samples/langchain_openai_tts.py) generates a short Japanese script with the local LLM, sends it to the local TTS wrapper, and writes a WAV file. Shared client code lives in [lib](lib), and app entry points live under [apps](apps).
@@ -213,6 +215,11 @@ Wrapper:
 - `TTS_DEFAULT_TASK_TYPE`
 - `TTS_DEFAULT_LANGUAGE`
 - `TTS_DEFAULT_VOICE`
+- `TTS_WARMUP_TEXT`
+- `TTS_WARMUP_ENGLISH_TEXT`
+- `TTS_TEMPERATURE`
+- `TTS_ALPHA`
+- `TTS_BETA`
 - `TTS_PUBLIC_MODEL_NAME`
 
 To switch the wrapper to Respair's Tsukasa Speech backend, start the dedicated service and wrapper with `TTS_BACKEND=tsukasa-speech`.

@@ -10,6 +10,7 @@ import queue
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, cast
@@ -29,7 +30,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pydantic import SecretStr
 from reachy_mini import ReachyMini
 from reachy_audio import HeadWobbler, get_wobble_origin_pose
-from state import AssistantSpeechState
+from state import AssistantSpeechState, RuntimeSettings
 from websockets import connect as ws_connect
 
 from reachy_conversation_tools import ReachyToolRuntime, build_langchain_tools
@@ -53,6 +54,10 @@ class SynthesizedAudio:
 class PipelineResult:
     assistant_text: str
     audio: SynthesizedAudio
+
+
+class SpeechInterruptedError(RuntimeError):
+    pass
 
 
 def _content_text(content: Any) -> str:
@@ -213,6 +218,59 @@ def _tts_backend_override(args: argparse.Namespace) -> str:
     return backend.strip()
 
 
+def _tts_ref_audio_override(args: argparse.Namespace) -> str | dict[str, str] | None:
+    ref_audio = getattr(args, "tts_ref_audio", None)
+    if isinstance(ref_audio, str):
+        return ref_audio.strip() or None
+    if isinstance(ref_audio, dict):
+        normalized = {
+            key.strip(): value.strip()
+            for key, value in ref_audio.items()
+            if isinstance(key, str) and key.strip() and isinstance(value, str) and value.strip()
+        }
+        return normalized or None
+    return None
+
+
+def _tts_ref_text_override(args: argparse.Namespace) -> str | dict[str, str] | None:
+    ref_text = getattr(args, "tts_ref_text", None)
+    if isinstance(ref_text, str):
+        return ref_text.strip() or None
+    if isinstance(ref_text, dict):
+        normalized = {
+            key.strip(): value.strip()
+            for key, value in ref_text.items()
+            if isinstance(key, str) and key.strip() and isinstance(value, str) and value.strip()
+        }
+        return normalized or None
+    return None
+
+
+def _tts_x_vector_only_mode(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "tts_x_vector_only_mode", False))
+
+
+def _tts_temperature_override(args: argparse.Namespace) -> float | None:
+    temperature = getattr(args, "tts_temperature", None)
+    if isinstance(temperature, (int, float)):
+        return float(temperature)
+    return None
+
+
+def _tts_alpha_override(args: argparse.Namespace) -> float | None:
+    alpha = getattr(args, "tts_alpha", None)
+    if isinstance(alpha, (int, float)):
+        return float(alpha)
+    return None
+
+
+def _tts_beta_override(args: argparse.Namespace) -> float | None:
+    beta = getattr(args, "tts_beta", None)
+    if isinstance(beta, (int, float)):
+        return float(beta)
+    return None
+
+
 def _tts_session_update_payload(args: argparse.Namespace) -> dict[str, Any]:
     session: dict[str, Any] = {
         "model": args.tts_model,
@@ -224,6 +282,23 @@ def _tts_session_update_payload(args: argparse.Namespace) -> dict[str, Any]:
     backend = _tts_backend_override(args)
     if backend:
         session["backend"] = backend
+    ref_audio = _tts_ref_audio_override(args)
+    if ref_audio:
+        session["ref_audio"] = ref_audio
+    ref_text = _tts_ref_text_override(args)
+    if ref_text:
+        session["ref_text"] = ref_text
+    if _tts_x_vector_only_mode(args):
+        session["x_vector_only_mode"] = True
+    temperature = _tts_temperature_override(args)
+    if temperature is not None:
+        session["temperature"] = temperature
+    alpha = _tts_alpha_override(args)
+    if alpha is not None:
+        session["alpha"] = alpha
+    beta = _tts_beta_override(args)
+    if beta is not None:
+        session["beta"] = beta
     return session
 
 
@@ -241,6 +316,23 @@ def _tts_http_request_payload(args: argparse.Namespace, text: str) -> dict[str, 
     backend = _tts_backend_override(args)
     if backend:
         payload["backend"] = backend
+    ref_audio = _tts_ref_audio_override(args)
+    if ref_audio:
+        payload["ref_audio"] = ref_audio
+    ref_text = _tts_ref_text_override(args)
+    if ref_text:
+        payload["ref_text"] = ref_text
+    if _tts_x_vector_only_mode(args):
+        payload["x_vector_only_mode"] = True
+    temperature = _tts_temperature_override(args)
+    if temperature is not None:
+        payload["temperature"] = temperature
+    alpha = _tts_alpha_override(args)
+    if alpha is not None:
+        payload["alpha"] = alpha
+    beta = _tts_beta_override(args)
+    if beta is not None:
+        payload["beta"] = beta
     return payload
 
 
@@ -379,10 +471,26 @@ class ReachyTTSProcessor(FrameProcessor):
         self._pending_text = ""
         self._segment_queue: asyncio.Queue[str | None] | None = None
         self._worker_task: asyncio.Task[None] | None = None
+        self._interrupt_event = asyncio.Event()
+
+    async def request_interrupt(self) -> None:
+        self._interrupt_event.set()
+        if self._segment_queue is None:
+            return
+        while True:
+            try:
+                item = self._segment_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._segment_queue.task_done()
+                if item is None:
+                    return
+        await self._segment_queue.put(None)
 
     async def _stop_worker(self) -> None:
         if self._segment_queue is not None:
-            await self._segment_queue.put(None)
+            await self.request_interrupt()
         if self._worker_task is not None:
             with suppress(asyncio.CancelledError):
                 await self._worker_task
@@ -398,10 +506,12 @@ class ReachyTTSProcessor(FrameProcessor):
                     while True:
                         segment = await self._segment_queue.get()
                         try:
-                            if segment is None:
+                            if segment is None or self._interrupt_event.is_set():
                                 return
                             self._logger.info("[bold green]TTS[/] synthesizing segment %s", segment)
                             async for audio_frame in synthesize_realtime_audio_stream(self._args, websocket, segment):
+                                if self._interrupt_event.is_set():
+                                    return
                                 await self.push_frame(audio_frame, direction)
                         finally:
                             self._segment_queue.task_done()
@@ -409,10 +519,12 @@ class ReachyTTSProcessor(FrameProcessor):
                 while True:
                     segment = await self._segment_queue.get()
                     try:
-                        if segment is None:
+                        if segment is None or self._interrupt_event.is_set():
                             return
                         self._logger.info("[bold green]TTS[/] synthesizing segment %s", segment)
                         async for audio_frame in synthesize_audio_stream(self._args, segment):
+                            if self._interrupt_event.is_set():
+                                return
                             await self.push_frame(audio_frame, direction)
                     finally:
                         self._segment_queue.task_done()
@@ -425,12 +537,16 @@ class ReachyTTSProcessor(FrameProcessor):
         if isinstance(frame, LLMFullResponseStartFrame):
             self._logger.info("[bold green]TTS[/] response stream started")
             self._pending_text = ""
+            self._interrupt_event.clear()
             self._segment_queue = asyncio.Queue()
             self._worker_task = asyncio.create_task(self._tts_worker(direction))
             await self.push_frame(frame, direction)
             return
 
         if isinstance(frame, LLMTextFrame):
+            if self._interrupt_event.is_set():
+                await self.push_frame(frame, direction)
+                return
             if frame.text:
                 self._pending_text += frame.text
                 segments, remainder = _drain_ready_segments(
@@ -448,16 +564,17 @@ class ReachyTTSProcessor(FrameProcessor):
 
         if isinstance(frame, LLMFullResponseEndFrame):
             if self._segment_queue is not None:
-                segments, remainder = _drain_ready_segments(
-                    self._pending_text,
-                    final=True,
-                    newline_threshold=self._args.tts_segment_newline_threshold,
-                    max_chars=self._args.tts_segment_max_chars,
-                )
-                self._pending_text = remainder
-                for segment in segments:
-                    await self._segment_queue.put(segment)
-                await self._segment_queue.join()
+                if not self._interrupt_event.is_set():
+                    segments, remainder = _drain_ready_segments(
+                        self._pending_text,
+                        final=True,
+                        newline_threshold=self._args.tts_segment_newline_threshold,
+                        max_chars=self._args.tts_segment_max_chars,
+                    )
+                    self._pending_text = remainder
+                    for segment in segments:
+                        await self._segment_queue.put(segment)
+                    await self._segment_queue.join()
                 await self._stop_worker()
             self._logger.info("[bold green]TTS[/] response stream finished")
             await self.push_frame(frame, direction)
@@ -512,6 +629,29 @@ class ReachyAudioPlayer(FrameProcessor):
         self._playback_queue: queue.Queue[tuple[np.ndarray, int] | None] = queue.Queue(maxsize=self._playback_queue_limit)
         self._playback_thread: threading.Thread | None = None
         self._playback_stop = threading.Event()
+
+    def abort(self) -> None:
+        if self._playback_thread is None:
+            return
+        self._playback_stop.set()
+        while True:
+            try:
+                item = self._playback_queue.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                self._playback_queue.task_done()
+                if item is None:
+                    break
+        with suppress(queue.Full):
+            self._playback_queue.put_nowait(None)
+        self._playback_thread.join(timeout=0.25)
+        self._playback_thread = None
+        with suppress(Exception):
+            self._robot.media.stop_playing()
+            self._robot.media.start_playing()
+        if self._head_wobbler is not None:
+            self._head_wobbler.stop()
 
     def close(self, timeout_s: float | None = None) -> None:
         if self._closed:
@@ -573,6 +713,8 @@ class ReachyAudioPlayer(FrameProcessor):
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, OutputAudioRawFrame):
+            if self._playback_stop.is_set():
+                return
             if self._assistant_speech_state is not None:
                 self._assistant_speech_state.note_output_audio(
                     sample_count=len(frame.audio) // (2 * max(1, frame.num_channels)),
@@ -590,6 +732,8 @@ class ReachyAudioPlayer(FrameProcessor):
             self._ensure_playback_worker()
             chunk_frames = max(1, int(round(output_rate * self._playback_chunk_ms / 1000.0)))
             for start in range(0, waveform.shape[0], chunk_frames):
+                if self._playback_stop.is_set():
+                    return
                 chunk = np.array(waveform[start : start + chunk_frames], copy=True)
                 await asyncio.to_thread(self._playback_queue.put, (chunk, output_rate))
         elif isinstance(frame, EndFrame):
@@ -597,6 +741,11 @@ class ReachyAudioPlayer(FrameProcessor):
             if self._head_wobbler is not None:
                 self._head_wobbler.request_reset_after_current_audio()
         await self.push_frame(frame, direction)
+
+
+async def _wait_for_settings_interrupt(runtime_settings: RuntimeSettings, expected_settings_version: int) -> None:
+    while runtime_settings.snapshot()[-1] == expected_settings_version:
+        await asyncio.sleep(0.05)
 
 
 class ResultCollector(FrameProcessor):
@@ -702,6 +851,10 @@ async def run_pipeline(
     history: list[dict[str, str]],
     enabled_tool_names: list[str],
     assistant_speech_state: AssistantSpeechState | None = None,
+    runtime_settings: RuntimeSettings | None = None,
+    expected_settings_version: int | None = None,
+    interrupt_event: asyncio.Event | None = None,
+    interrupt_reason: str = "assistant speech interrupted",
 ) -> PipelineResult:
     tools = build_langchain_tools(runtime, enabled_tool_names)
     llm = ReachyLangChainProcessor(args, tools)
@@ -723,12 +876,53 @@ async def run_pipeline(
     terminator.bind_task(task)
     runner = _create_turn_pipeline_runner()
     runner_task = asyncio.create_task(runner.run(task))
+    interrupt_task: asyncio.Task[None] | None = None
+    external_interrupt_task: asyncio.Task[bool] | None = None
+    if runtime_settings is not None and expected_settings_version is not None:
+        interrupt_task = asyncio.create_task(_wait_for_settings_interrupt(runtime_settings, expected_settings_version))
+    if interrupt_event is not None:
+        external_interrupt_task = asyncio.create_task(interrupt_event.wait())
     await task.queue_frame(LLMContextFrame(_build_llm_context(history, transcript_text)))
+    interrupted = False
     try:
-        await runner_task
+        if interrupt_task is None and external_interrupt_task is None:
+            await runner_task
+        else:
+            wait_tasks: set[asyncio.Task[Any]] = {runner_task}
+            if interrupt_task is not None:
+                wait_tasks.add(interrupt_task)
+            if external_interrupt_task is not None:
+                wait_tasks.add(external_interrupt_task)
+            done, _pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+            if runner_task in done:
+                await runner_task
+            else:
+                interrupted = True
+                reason = interrupt_reason if external_interrupt_task is not None and external_interrupt_task in done else "live settings changed"
+                logging.getLogger("conversation.tts").info("[bold green]TTS[/] interrupting live reply because %s", reason)
+                await tts.request_interrupt()
+                audio_player.abort()
+                with suppress(Exception):
+                    await task.queue_frame(EndFrame())
+                try:
+                    await asyncio.wait_for(runner_task, timeout=1.0)
+                except asyncio.TimeoutError:
+                    runner_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await runner_task
     finally:
+        if interrupt_task is not None:
+            interrupt_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await interrupt_task
+        if external_interrupt_task is not None:
+            external_interrupt_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await external_interrupt_task
         await asyncio.to_thread(audio_player.close)
 
+    if interrupted:
+        raise SpeechInterruptedError(interrupt_reason)
     if collector.errors:
         raise RuntimeError("; ".join(collector.errors))
     assistant_text = "".join(collector.assistant_chunks).strip()
