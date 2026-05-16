@@ -34,8 +34,8 @@ from config import load_entrypoint_env
 from openai_model_registry import resolve_model
 
 from gradio_ui import launch_gradio_ui
-from pipeline import ReachyAudioPlayer, ReachyRealtimeTTSSession, SpeechInterruptedError, SynthesizedAudio, _drain_ready_segments, _resample_audio, run_pipeline, synthesize_audio_stream, synthesize_realtime_audio_stream
-from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, DEFAULT_TTS_INSTRUCTIONS, AssistantSpeechState, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, build_tts_request_voice, effective_tts_transport, is_custom_voice_choice, listening_gate_settings, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_qwen_voice_by_name, load_profile_tts_instructions_by_name, load_profile_tts_ref_audio_by_name, load_profile_tts_ref_text_by_name, load_profile_voice_by_name, load_selected_profile_name, normalize_tts_backend_name, overlap_turn_rejection_reason, save_profile_definition as _save_profile_definition
+from pipeline import PipelineResult, ReachyAudioPlayer, ReachyRealtimeTTSSession, SpeechInterruptedError, SynthesizedAudio, _drain_ready_segments, _resample_audio, run_pipeline, synthesize_audio_stream, synthesize_realtime_audio_stream
+from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, DEFAULT_TTS_INSTRUCTIONS, AssistantSpeechState, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, build_tts_request_voice, effective_tts_transport, listening_gate_settings, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_qwen_voice_by_name, load_profile_tts_instructions_by_name, load_profile_tts_ref_audio_by_name, load_profile_tts_ref_text_by_name, load_profile_voice_by_name, load_selected_profile_name, normalize_tts_backend_name, overlap_turn_rejection_reason, save_profile_definition as _save_profile_definition
 
 load_entrypoint_env(local_tts, asr_tools)
 
@@ -52,18 +52,17 @@ TTS_MODEL_FALLBACK = local_tts.TTS_MODEL_FALLBACK
 TTS_TASK_TYPE = local_tts.TTS_TASK_TYPE
 TTS_LANGUAGE = local_tts.TTS_LANGUAGE
 TTS_TEMPERATURE = local_tts.TTS_TEMPERATURE
-TTS_ALPHA = local_tts.TTS_ALPHA
-TTS_BETA = local_tts.TTS_BETA
 TTS_INSTRUCTIONS = local_tts.TTS_INSTRUCTIONS
 TTS_SAMPLE_RATE = local_tts.TTS_SAMPLE_RATE
 TTS_BACKEND = os.environ.get("TTS_BACKEND", "")
 TTS_DEBUG_CAPTURE = os.environ.get("TTS_DEBUG_CAPTURE", "0") not in {"", "0", "false", "False", "no", "off"}
 VOICE = local_tts.VOICE
-REACHY_HOST = os.environ.get("REACHY_HOST", "reachy-mini.local").strip() or "reachy-mini.local"
 
 TTS_TRANSPORT = os.environ.get("TTS_TRANSPORT", "realtime")
 TTS_SEGMENT_NEWLINE_THRESHOLD = int(os.environ.get("TTS_SEGMENT_NEWLINE_THRESHOLD", "2"))
+TTS_SEGMENT_MIN_CHARS = int(os.environ.get("TTS_SEGMENT_MIN_CHARS", "0"))
 TTS_SEGMENT_MAX_CHARS = int(os.environ.get("TTS_SEGMENT_MAX_CHARS", "100"))
+TURN_IDLE_TIMEOUT_SECONDS = float(os.environ.get("TURN_IDLE_TIMEOUT_SECONDS", "120"))
 SHUTDOWN_STEP_TIMEOUT_S = 2.0
 ASR_MIN_SEGMENT_AVG_LOGPROB = float(os.environ.get("ASR_MIN_SEGMENT_AVG_LOGPROB", "-0.75"))
 ASR_MAX_SEGMENT_NO_SPEECH_PROB = float(os.environ.get("ASR_MAX_SEGMENT_NO_SPEECH_PROB", "0.6"))
@@ -89,6 +88,8 @@ class CapturedUtterance:
     duration_ms: float
     overlap_gate_active: bool
     barge_in_candidate: bool = False
+    transcription_payload: str | dict[str, Any] | None = None
+    transcript_text: str = ""
 
 
 def _normalize_transcript_language(value: Any) -> str:
@@ -131,6 +132,47 @@ def _segment_metric_summary(payload: dict[str, Any]) -> tuple[float | None, floa
     mean_avg_logprob = sum(avg_logprobs) / len(avg_logprobs) if avg_logprobs else None
     max_no_speech_prob = max(no_speech_probs) if no_speech_probs else None
     return mean_avg_logprob, max_no_speech_prob
+
+
+def _transcript_observation_fields(payload: str | dict[str, Any], transcript_text: str | None = None) -> tuple[str, str, str, str]:
+    normalized_text = str(transcript_text or "").strip()
+    if isinstance(payload, dict):
+        language = _normalize_transcript_language(payload.get("language")) or "unknown"
+        mean_avg_logprob, max_no_speech_prob = _segment_metric_summary(payload)
+        if not normalized_text:
+            normalized_text = str(payload.get("text") or "").strip()
+    else:
+        language = "unknown"
+        mean_avg_logprob = None
+        max_no_speech_prob = None
+        if not normalized_text:
+            normalized_text = str(payload or "").strip()
+
+    avg_logprob_text = f"{mean_avg_logprob:.2f}" if mean_avg_logprob is not None else "n/a"
+    no_speech_prob_text = f"{max_no_speech_prob:.2f}" if max_no_speech_prob is not None else "n/a"
+    return language, avg_logprob_text, no_speech_prob_text, normalized_text
+
+
+def _log_transcript_judgement(
+    logger: logging.Logger,
+    *,
+    label: str,
+    payload: str | dict[str, Any],
+    transcript_text: str | None,
+    accepted: bool,
+    rejection_reason: str | None = None,
+) -> None:
+    language, avg_logprob_text, no_speech_prob_text, normalized_text = _transcript_observation_fields(payload, transcript_text)
+    logger.info(
+        "[bold blue]ASR[/] %s result=%s language=%s avg_logprob=%s max_no_speech_prob=%s text=%s%s",
+        label,
+        "accepted" if accepted else "rejected",
+        language,
+        avg_logprob_text,
+        no_speech_prob_text,
+        normalized_text,
+        f" reason={rejection_reason}" if rejection_reason else "",
+    )
 
 
 def transcript_quality_rejection_reason(payload: dict[str, Any], args: argparse.Namespace) -> str | None:
@@ -176,29 +218,8 @@ def load_profile_prompt(args: argparse.Namespace) -> str:
 
 
 def _apply_profile_tts_prompt_assets(args: argparse.Namespace, profiles_dir: Path, profile: str) -> None:
-    raw_ref_audio = load_profile_tts_ref_audio_by_name(profiles_dir, profile)
-    raw_ref_text = load_profile_tts_ref_text_by_name(profiles_dir, profile)
-    selected_tsukasa_voice = str(getattr(args, "profile_voice_choice", "")).strip()
-    selected_qwen_voice = str(getattr(args, "profile_qwen_voice_choice", "")).strip()
-
-    filtered_ref_audio: dict[str, str] = {}
-    if is_custom_voice_choice(selected_tsukasa_voice) and isinstance(raw_ref_audio, dict):
-        tsukasa_ref_audio = str(raw_ref_audio.get("tsukasa-speech") or "").strip()
-        if tsukasa_ref_audio:
-            filtered_ref_audio["tsukasa-speech"] = tsukasa_ref_audio
-    if is_custom_voice_choice(selected_qwen_voice) and isinstance(raw_ref_audio, dict):
-        qwen_ref_audio = str(raw_ref_audio.get("qwen3-tts") or "").strip()
-        if qwen_ref_audio:
-            filtered_ref_audio["qwen3-tts"] = qwen_ref_audio
-
-    filtered_ref_text: dict[str, str] = {}
-    if is_custom_voice_choice(selected_qwen_voice) and isinstance(raw_ref_text, dict):
-        qwen_ref_text = str(raw_ref_text.get("qwen3-tts") or "").strip()
-        if qwen_ref_text:
-            filtered_ref_text["qwen3-tts"] = qwen_ref_text
-
-    args.tts_ref_audio = filtered_ref_audio or None
-    args.tts_ref_text = filtered_ref_text or None
+    args.tts_ref_audio = load_profile_tts_ref_audio_by_name(profiles_dir, profile)
+    args.tts_ref_text = load_profile_tts_ref_text_by_name(profiles_dir, profile)
 
     qwen_ref_audio = ""
     if isinstance(args.tts_ref_audio, dict):
@@ -264,8 +285,6 @@ async def _play_assistant_text(
     text: str,
     *,
     assistant_speech_state: AssistantSpeechState | None = None,
-    runtime_settings: RuntimeSettings | None = None,
-    expected_settings_version: int | None = None,
     interrupt_event: asyncio.Event | None = None,
 ) -> None:
     if not text.strip():
@@ -286,25 +305,20 @@ async def _play_assistant_text(
         if args.tts_transport == "realtime":
             async with ReachyRealtimeTTSSession(args) as websocket:
                 async for audio_frame in synthesize_realtime_audio_stream(args, websocket, text):
-                    settings_interrupted = runtime_settings is not None and expected_settings_version is not None and _settings_changed_during_turn(runtime_settings, expected_settings_version)
-                    external_interrupted = interrupt_event is not None and interrupt_event.is_set()
-                    if settings_interrupted or external_interrupted:
+                    if interrupt_event is not None and interrupt_event.is_set():
                         interrupted = True
                         audio_player.abort()
                         break
                     await audio_player.process_frame(audio_frame, FrameDirection.DOWNSTREAM)
         else:
             async for audio_frame in synthesize_audio_stream(args, text):
-                settings_interrupted = runtime_settings is not None and expected_settings_version is not None and _settings_changed_during_turn(runtime_settings, expected_settings_version)
-                external_interrupted = interrupt_event is not None and interrupt_event.is_set()
-                if settings_interrupted or external_interrupted:
+                if interrupt_event is not None and interrupt_event.is_set():
                     interrupted = True
                     audio_player.abort()
                     break
                 await audio_player.process_frame(audio_frame, FrameDirection.DOWNSTREAM)
         if interrupted:
-            reason = "live settings change" if interrupt_event is None or not interrupt_event.is_set() else "user speech"
-            raise SpeechInterruptedError(f"assistant speech interrupted by {reason}")
+            raise SpeechInterruptedError("assistant speech interrupted by user speech")
         await audio_player.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
     finally:
         await asyncio.to_thread(audio_player.close)
@@ -317,8 +331,6 @@ async def _speak_persona_greeting(
     *,
     reason: str,
     assistant_speech_state: AssistantSpeechState | None = None,
-    runtime_settings: RuntimeSettings | None = None,
-    expected_settings_version: int | None = None,
     interrupt_event: asyncio.Event | None = None,
 ) -> list[dict[str, str]]:
     greeting = await _generate_persona_greeting(args, reason=reason)
@@ -328,8 +340,6 @@ async def _speak_persona_greeting(
         robot,
         greeting,
         assistant_speech_state=assistant_speech_state,
-        runtime_settings=runtime_settings,
-        expected_settings_version=expected_settings_version,
         interrupt_event=interrupt_event,
     )
     updated_history = [*history, {"role": "assistant", "content": greeting}]
@@ -350,7 +360,6 @@ def configure_logging(debug: bool) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reachy Mini conversation app powered by local ASR, LLM, and TTS servers.")
     parser.add_argument("--robot-name", help="Optional Reachy Mini robot name when multiple robots are available.")
-    parser.add_argument("--robot-host", default=REACHY_HOST, help="Reachy Mini hostname or IP address.")
     parser.add_argument("--profile", help="Profile name under apps/conversation/profiles. Defaults to the last saved selection, or 'default'.")
     parser.add_argument("--profiles-dir", default=str(APP_DIR / "profiles"), help="Directory containing profile folders.")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="Directory for captured audio and snapshots.")
@@ -384,7 +393,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assistant-speaking-vad-start-ms", type=int, default=400, help="Minimum continuous speech required to start capture while Reachy's reply is still playing.")
     parser.add_argument("--assistant-speaking-min-vad-ms", type=int, default=500, help="Minimum captured speech duration required to keep a turn while Reachy's reply is still playing.")
     parser.add_argument("--assistant-speaking-min-chars", type=int, default=4, help="Minimum transcript length required to keep a turn while Reachy's reply is still playing.")
-    parser.add_argument("--assistant-speaking-interrupt-min-vad-ms", type=int, default=ASSISTANT_SPEAKING_INTERRUPT_MIN_VAD_MS, help="Minimum captured speech duration required to interrupt Reachy's current speech and treat it as a barge-in turn.")
+    parser.add_argument("--assistant-speaking-interrupt-min-vad-ms", type=int, default=ASSISTANT_SPEAKING_INTERRUPT_MIN_VAD_MS, help="Minimum captured speech duration required to interrupt Reachy's current reply and keep it as a barge-in turn.")
     parser.add_argument("--assistant-speaking-interrupt-min-chars", type=int, default=ASSISTANT_SPEAKING_INTERRUPT_MIN_CHARS, help="Minimum transcript length required to keep a barge-in turn captured while Reachy is speaking.")
     parser.add_argument("--assistant-speaking-tail-ms", type=int, default=350, help="Extra time after queued TTS audio where overlap protection stays active.")
     parser.add_argument("--listen-timeout-seconds", type=float, default=20.0, help="Maximum time to wait for a new utterance.")
@@ -393,7 +402,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-segment-avg-logprob", type=float, default=ASR_MIN_SEGMENT_AVG_LOGPROB, help="Reject STT turns when the mean Whisper segment avg_logprob falls below this threshold.")
     parser.add_argument("--max-segment-no-speech-prob", type=float, default=ASR_MAX_SEGMENT_NO_SPEECH_PROB, help="Reject STT turns when any Whisper segment no_speech_prob exceeds this threshold.")
     parser.add_argument("--allowed-transcript-languages", default=ASR_ALLOWED_LANGUAGES, help="Optional comma-separated detected STT languages to accept, for example 'ja,en'. When empty, an explicit --language hint is used as the only allowed language.")
-    parser.add_argument("--excluded-transcript-languages", default=ASR_EXCLUDED_LANGUAGES, help="Optional comma-separated detected STT languages to reject before any allow-list checks, for example 'ru,es,fr'.")
+    parser.add_argument("--excluded-transcript-languages", default=ASR_EXCLUDED_LANGUAGES, help="Optional comma-separated detected STT languages to reject before allow-list checks, for example 'ru,es,fr'.")
 
     parser.add_argument("--chat-base-url", default=CHAT_BASE_URL, help="OpenAI-compatible chat base URL.")
     parser.add_argument("--chat-api-key", default=CHAT_API_KEY, help="Bearer token for the chat endpoint.")
@@ -410,14 +419,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tts-task-type", default=TTS_TASK_TYPE, help="TTS task type.")
     parser.add_argument("--tts-language", default=TTS_LANGUAGE, help="TTS language.")
     parser.add_argument("--tts-temperature", type=float, default=TTS_TEMPERATURE, help="Optional TTS sampling temperature override. Leave unset to use the backend default.")
-    parser.add_argument("--tts-alpha", type=float, default=TTS_ALPHA, help="Optional Tsukasa alpha override. Leave unset to use the backend default.")
-    parser.add_argument("--tts-beta", type=float, default=TTS_BETA, help="Optional Tsukasa beta override. Leave unset to use the backend default.")
     parser.add_argument("--voice", default=VOICE, help="TTS voice name.")
     parser.add_argument("--tts-instructions", default=TTS_INSTRUCTIONS, help="Instructions sent to the TTS wrapper.")
     parser.add_argument("--tts-sample-rate", type=int, default=TTS_SAMPLE_RATE, help="Expected TTS sample rate.")
     parser.add_argument("--tts-transport", choices=["realtime", "http"], default=TTS_TRANSPORT, help="TTS transport used for streaming.")
     parser.add_argument("--tts-segment-newline-threshold", type=int, default=TTS_SEGMENT_NEWLINE_THRESHOLD, help="Flush streamed TTS text only after this many consecutive newlines. Set to 0 to disable newline-based flushing.")
+    parser.add_argument("--tts-segment-min-chars", type=int, default=TTS_SEGMENT_MIN_CHARS, help="Flush streamed TTS text at sentence punctuation once the buffered segment reaches this many characters. Set to 0 to disable this gate and flush at sentence punctuation immediately.")
     parser.add_argument("--tts-segment-max-chars", type=int, default=TTS_SEGMENT_MAX_CHARS, help="Flush streamed TTS text once the buffered segment reaches this many characters. Set to 0 to disable length-based flushing.")
+    parser.add_argument("--turn-idle-timeout-seconds", type=float, default=TURN_IDLE_TIMEOUT_SECONDS, help="Pipeline idle timeout for a single conversation turn. Increase this if a long TTS segment can take a while before producing audio.")
     parser.add_argument("--tts-debug-capture", action=argparse.BooleanOptionalAction, default=TTS_DEBUG_CAPTURE, help="When enabled, save synthesized reply audio plus a reverse-transcription debug manifest for TTS dropout diagnosis.")
     parser.add_argument("--save-replies", action=argparse.BooleanOptionalAction, default=False, help="Save synthesized assistant replies as WAV files.")
     args = parser.parse_args()
@@ -467,8 +476,6 @@ async def capture_robot_utterance(
     robot: ReachyMini,
     args: argparse.Namespace,
     assistant_speech_state: AssistantSpeechState | None = None,
-    runtime_settings: RuntimeSettings | None = None,
-    expected_settings_version: int | None = None,
     stop_when_assistant_stops: bool = False,
     overlap_min_vad_ms: int | None = None,
     barge_in_candidate: bool = False,
@@ -497,10 +504,6 @@ async def capture_robot_utterance(
     )
 
     while True:
-        if runtime_settings is not None and expected_settings_version is not None:
-            if _settings_changed_during_turn(runtime_settings, expected_settings_version):
-                logger.info("[bold blue]ASR[/] aborting capture wait because live settings changed")
-                return None
         if capture_started_at is None and perf_counter() - listen_started_at >= args.listen_timeout_seconds:
             logger.debug("No speech detected before listen timeout")
             return None
@@ -526,7 +529,7 @@ async def capture_robot_utterance(
         )
         overlap_gate_active = overlap_gate_active or assistant_speaking
         if stop_when_assistant_stops and assistant_speaking_observed and not assistant_speaking and not speech_active:
-            logger.debug("Assistant speech ended before barge-in capture triggered")
+            logger.debug("Assistant speech ended before barge-in capture started")
             return None
 
         if not speech_active:
@@ -620,19 +623,6 @@ async def transcribe_captured_audio(args: argparse.Namespace, utterance: Capture
         payload = await asr_tools.transcribe_realtime(request_args, audio)
     else:
         payload = await asyncio.to_thread(asr_tools.transcribe_http, request_args, audio)
-    if not applied_language and isinstance(payload, dict):
-        detected_language = _normalize_transcript_language(payload.get("language"))
-        if detected_language:
-            mean_avg_logprob, max_no_speech_prob = _segment_metric_summary(payload)
-            metric_parts: list[str] = []
-            if mean_avg_logprob is not None:
-                metric_parts.append(f"avg_logprob={mean_avg_logprob:.2f}")
-            if max_no_speech_prob is not None:
-                metric_parts.append(f"max_no_speech_prob={max_no_speech_prob:.2f}")
-            metric_suffix = f" {' '.join(metric_parts)}" if metric_parts else ""
-            transcript_text = str(payload.get("text") or "").strip()
-            text_suffix = f" text={transcript_text}" if transcript_text else ""
-            logger.info("[bold blue]ASR[/] detected language=%s%s%s", detected_language, metric_suffix, text_suffix)
     logger.info("[bold blue]ASR[/] transcription finished in %.2fs", perf_counter() - started_at)
     return payload
 
@@ -684,16 +674,19 @@ def _debug_reply_manifest_path(saved_audio: Path) -> Path:
 
 
 def _debug_reply_segments(text: str, args: argparse.Namespace) -> list[str]:
+    first_min_chars = args.tts_segment_min_chars
     segments, remainder = _drain_ready_segments(
         text,
         final=False,
         newline_threshold=args.tts_segment_newline_threshold,
+        min_chars=first_min_chars,
         max_chars=args.tts_segment_max_chars,
     )
     tail_segments, _tail_remainder = _drain_ready_segments(
         remainder,
         final=True,
         newline_threshold=args.tts_segment_newline_threshold,
+        min_chars=0 if segments else first_min_chars,
         max_chars=args.tts_segment_max_chars,
     )
     return [*segments, *tail_segments]
@@ -813,31 +806,78 @@ def _settings_changed_during_turn(runtime_settings: RuntimeSettings, expected_ve
     return runtime_settings.snapshot()[-1] != expected_version
 
 
-def _consume_pending_greeting_reason(runtime_settings: RuntimeSettings) -> str | None:
-    if not hasattr(type(runtime_settings), "consume_pending_greeting_reason"):
-        return None
-    reason = runtime_settings.consume_pending_greeting_reason()
-    return str(reason or "").strip() or None
-
-
 async def _capture_barge_in_utterance(
     robot: ReachyMini,
     args: argparse.Namespace,
     *,
     assistant_speech_state: AssistantSpeechState,
-    runtime_settings: RuntimeSettings,
-    expected_settings_version: int,
 ) -> CapturedUtterance | None:
-    return await capture_robot_utterance(
-        robot,
-        args,
-        assistant_speech_state=assistant_speech_state,
-        runtime_settings=runtime_settings,
-        expected_settings_version=expected_settings_version,
-        stop_when_assistant_stops=True,
-        overlap_min_vad_ms=args.assistant_speaking_interrupt_min_vad_ms,
-        barge_in_candidate=True,
-    )
+    asr_logger = logging.getLogger("conversation.asr")
+    while True:
+        utterance = await capture_robot_utterance(
+            robot,
+            args,
+            assistant_speech_state=assistant_speech_state,
+            stop_when_assistant_stops=True,
+            overlap_min_vad_ms=args.assistant_speaking_interrupt_min_vad_ms,
+            barge_in_candidate=True,
+        )
+        if utterance is None:
+            return None
+
+        payload = await transcribe_captured_audio(args, utterance)
+        transcript_text = payload if isinstance(payload, str) else str(payload.get("text", "")).strip()
+        if not transcript_text:
+            _log_transcript_judgement(
+                asr_logger,
+                label="barge-in",
+                payload=payload,
+                transcript_text=transcript_text,
+                accepted=False,
+                rejection_reason="empty transcript",
+            )
+            continue
+
+        if isinstance(payload, dict):
+            rejection_reason = transcript_quality_rejection_reason(payload, args)
+            if rejection_reason is not None:
+                _log_transcript_judgement(
+                    asr_logger,
+                    label="barge-in",
+                    payload=payload,
+                    transcript_text=transcript_text,
+                    accepted=False,
+                    rejection_reason=rejection_reason,
+                )
+                continue
+
+        rejection_reason = overlap_turn_rejection_reason(
+            captured_duration_ms=utterance.duration_ms,
+            transcript_text=transcript_text,
+            min_duration_ms=args.assistant_speaking_interrupt_min_vad_ms,
+            min_chars=args.assistant_speaking_interrupt_min_chars,
+        )
+        if rejection_reason is not None:
+            _log_transcript_judgement(
+                asr_logger,
+                label="barge-in",
+                payload=payload,
+                transcript_text=transcript_text,
+                accepted=False,
+                rejection_reason=rejection_reason,
+            )
+            continue
+
+        utterance.transcription_payload = payload
+        utterance.transcript_text = transcript_text
+        _log_transcript_judgement(
+            asr_logger,
+            label="barge-in",
+            payload=payload,
+            transcript_text=transcript_text,
+            accepted=True,
+        )
+        return utterance
 
 
 async def _speak_persona_greeting_with_barge_in(
@@ -847,8 +887,6 @@ async def _speak_persona_greeting_with_barge_in(
     *,
     reason: str,
     assistant_speech_state: AssistantSpeechState,
-    runtime_settings: RuntimeSettings,
-    expected_settings_version: int,
 ) -> tuple[list[dict[str, str]], CapturedUtterance | None]:
     interrupt_event = asyncio.Event()
     greeting_task = asyncio.create_task(
@@ -858,8 +896,6 @@ async def _speak_persona_greeting_with_barge_in(
             history,
             reason=reason,
             assistant_speech_state=assistant_speech_state,
-            runtime_settings=runtime_settings,
-            expected_settings_version=expected_settings_version,
             interrupt_event=interrupt_event,
         )
     )
@@ -868,8 +904,6 @@ async def _speak_persona_greeting_with_barge_in(
             robot,
             args,
             assistant_speech_state=assistant_speech_state,
-            runtime_settings=runtime_settings,
-            expected_settings_version=expected_settings_version,
         )
     )
     try:
@@ -908,9 +942,7 @@ async def _run_pipeline_with_barge_in(
     *,
     robot: ReachyMini,
     assistant_speech_state: AssistantSpeechState,
-    runtime_settings: RuntimeSettings,
-    expected_settings_version: int,
-) -> tuple[SynthesizedAudio | Any | None, CapturedUtterance | None]:
+) -> tuple[PipelineResult | None, CapturedUtterance | None]:
     interrupt_event = asyncio.Event()
     reply_task = asyncio.create_task(
         run_pipeline(
@@ -920,8 +952,6 @@ async def _run_pipeline_with_barge_in(
             history,
             active_tools,
             assistant_speech_state=assistant_speech_state,
-            runtime_settings=runtime_settings,
-            expected_settings_version=expected_settings_version,
             interrupt_event=interrupt_event,
             interrupt_reason="assistant speech interrupted by user speech",
         )
@@ -931,8 +961,6 @@ async def _run_pipeline_with_barge_in(
             robot,
             args,
             assistant_speech_state=assistant_speech_state,
-            runtime_settings=runtime_settings,
-            expected_settings_version=expected_settings_version,
         )
     )
     try:
@@ -971,12 +999,9 @@ async def conversation_loop(args: argparse.Namespace) -> int:
     args.profile = args.profile or load_selected_profile_name(profiles_dir)
     args.system_prompt = load_profile_prompt(args)
     primary_voice = load_profile_voice_by_name(profiles_dir, args.profile, args.voice or DEFAULT_VOICE)
-    selected_qwen_voice = load_profile_qwen_voice_by_name(profiles_dir, args.profile)
-    args.profile_voice_choice = primary_voice
-    args.profile_qwen_voice_choice = selected_qwen_voice
     args.voice = build_tts_request_voice(
         primary_voice,
-        selected_qwen_voice,
+        load_profile_qwen_voice_by_name(profiles_dir, args.profile),
     )
     args.tts_instructions = load_profile_tts_instructions_by_name(profiles_dir, args.profile, args.tts_instructions or DEFAULT_TTS_INSTRUCTIONS)
     _apply_profile_tts_prompt_assets(args, profiles_dir, args.profile)
@@ -996,8 +1021,6 @@ async def conversation_loop(args: argparse.Namespace) -> int:
     robot_kwargs: dict[str, Any] = {}
     if args.robot_name:
         robot_kwargs["robot_name"] = args.robot_name
-    if args.robot_host:
-        robot_kwargs["host"] = args.robot_host
 
     history: list[dict[str, str]] = []
     data_dir = Path(args.data_dir).expanduser().resolve()
@@ -1028,7 +1051,6 @@ async def conversation_loop(args: argparse.Namespace) -> int:
 
     app_logger.info("[bold]Starting Reachy Mini conversation app[/]")
     app_logger.info("Profile=%s chat_model=%s stt_model=%s tts_model=%s", args.profile, args.chat_model, args.model, args.tts_model)
-    app_logger.info("Reachy host=%s robot_name=%s", args.robot_host, args.robot_name or "auto")
 
     robot = ReachyMini(**robot_kwargs)
     robot.enable_motors()
@@ -1049,31 +1071,22 @@ async def conversation_loop(args: argparse.Namespace) -> int:
         await _run_blocking_cleanup_step(app_logger, "media.start_recording", robot.media.start_recording)
         await _run_blocking_cleanup_step(app_logger, "media.start_playing", robot.media.start_playing)
         app_logger.info("[bold]Reachy media pipelines started[/]")
-        try:
-            history, pending_utterance = await _speak_persona_greeting_with_barge_in(
-                args,
-                robot,
-                history,
-                reason="startup",
-                assistant_speech_state=assistant_speech_state,
-                expected_settings_version=runtime_settings.snapshot()[-1],
-                runtime_settings=runtime_settings,
-            )
-        except SpeechInterruptedError:
-            app_logger.info("[bold]Interrupted startup greeting because live settings changed[/]")
+        history, pending_utterance = await _speak_persona_greeting_with_barge_in(
+            args,
+            robot,
+            history,
+            reason="startup",
+            assistant_speech_state=assistant_speech_state,
+        )
 
         while not stop_event.is_set():
             active_profile, active_tools, _active_character_prompt, active_instructions, active_voice, active_qwen_voice, active_tts_instructions, settings_version = runtime_settings.snapshot()
-            pending_greeting_reason: str | None = None
             if settings_version != last_settings_version:
                 history.clear()
                 last_settings_version = settings_version
                 app_logger.info("[bold]Conversation history reset[/] profile=%s", active_profile)
-                pending_greeting_reason = _consume_pending_greeting_reason(runtime_settings)
             args.profile = active_profile
             args.system_prompt = active_instructions
-            args.profile_voice_choice = active_voice
-            args.profile_qwen_voice_choice = active_qwen_voice
             args.voice = build_tts_request_voice(
                 active_voice,
                 active_qwen_voice,
@@ -1081,71 +1094,62 @@ async def conversation_loop(args: argparse.Namespace) -> int:
             args.tts_instructions = active_tts_instructions
             _apply_profile_tts_prompt_assets(args, profiles_dir, active_profile)
             next_persona_signature = (active_profile, active_instructions)
-            if pending_greeting_reason:
-                try:
-                    history, pending_utterance = await _speak_persona_greeting_with_barge_in(
-                        args,
-                        robot,
-                        history,
-                        reason=pending_greeting_reason,
-                        assistant_speech_state=assistant_speech_state,
-                        expected_settings_version=settings_version,
-                        runtime_settings=runtime_settings,
-                    )
-                except SpeechInterruptedError:
-                    app_logger.info("[bold]Interrupted greeting because live settings changed again[/]")
-                    continue
-                current_persona_signature = next_persona_signature
-            elif next_persona_signature != current_persona_signature:
-                try:
-                    history, pending_utterance = await _speak_persona_greeting_with_barge_in(
-                        args,
-                        robot,
-                        history,
-                        reason="persona switch",
-                        assistant_speech_state=assistant_speech_state,
-                        expected_settings_version=settings_version,
-                        runtime_settings=runtime_settings,
-                    )
-                except SpeechInterruptedError:
-                    app_logger.info("[bold]Interrupted greeting because live settings changed again[/]")
-                    continue
+            if next_persona_signature != current_persona_signature:
+                history, pending_utterance = await _speak_persona_greeting_with_barge_in(
+                    args,
+                    robot,
+                    history,
+                    reason="persona switch",
+                    assistant_speech_state=assistant_speech_state,
+                )
                 current_persona_signature = next_persona_signature
             if pending_utterance is not None:
                 captured_utterance = pending_utterance
                 pending_utterance = None
             else:
-                captured_utterance = await capture_robot_utterance(
-                    robot,
-                    args,
-                    assistant_speech_state=assistant_speech_state,
-                    runtime_settings=runtime_settings,
-                    expected_settings_version=settings_version,
-                )
+                captured_utterance = await capture_robot_utterance(robot, args, assistant_speech_state=assistant_speech_state)
             if captured_utterance is None or stop_event.is_set():
                 continue
             if _settings_changed_during_turn(runtime_settings, settings_version):
                 app_logger.info("[bold]Discarding pending utterance because live settings changed[/]")
                 continue
 
-            payload = await transcribe_captured_audio(args, captured_utterance)
-            if _settings_changed_during_turn(runtime_settings, settings_version):
-                app_logger.info("[bold]Discarding transcript because live settings changed[/]")
-                continue
-            transcript_text = payload if isinstance(payload, str) else str(payload.get("text", "")).strip()
+            if captured_utterance.transcription_payload is not None:
+                payload = captured_utterance.transcription_payload
+                transcript_text = captured_utterance.transcript_text
+            else:
+                payload = await transcribe_captured_audio(args, captured_utterance)
+                if _settings_changed_during_turn(runtime_settings, settings_version):
+                    app_logger.info("[bold]Discarding transcript because live settings changed[/]")
+                    continue
+                transcript_text = payload if isinstance(payload, str) else str(payload.get("text", "")).strip()
             if not transcript_text:
-                asr_logger.warning("[bold blue]ASR[/] empty transcript, skipping turn")
+                _log_transcript_judgement(
+                    asr_logger,
+                    label="turn",
+                    payload=payload,
+                    transcript_text=transcript_text,
+                    accepted=False,
+                    rejection_reason="empty transcript",
+                )
                 continue
 
             if isinstance(payload, dict):
                 rejection_reason = transcript_quality_rejection_reason(payload, args)
                 if rejection_reason is not None:
-                    asr_logger.info("[bold blue]ASR[/] rejecting transcript (%s)", rejection_reason)
+                    _log_transcript_judgement(
+                        asr_logger,
+                        label="turn",
+                        payload=payload,
+                        transcript_text=transcript_text,
+                        accepted=False,
+                        rejection_reason=rejection_reason,
+                    )
                     continue
 
             if captured_utterance.overlap_gate_active:
-                min_overlap_chars = args.assistant_speaking_interrupt_min_chars if captured_utterance.barge_in_candidate else args.assistant_speaking_min_chars
                 min_overlap_vad_ms = args.assistant_speaking_interrupt_min_vad_ms if captured_utterance.barge_in_candidate else args.assistant_speaking_min_vad_ms
+                min_overlap_chars = args.assistant_speaking_interrupt_min_chars if captured_utterance.barge_in_candidate else args.assistant_speaking_min_chars
                 rejection_reason = overlap_turn_rejection_reason(
                     captured_duration_ms=captured_utterance.duration_ms,
                     transcript_text=transcript_text,
@@ -1153,11 +1157,23 @@ async def conversation_loop(args: argparse.Namespace) -> int:
                     min_chars=min_overlap_chars,
                 )
                 if rejection_reason is not None:
-                    log_label = "ignoring short barge-in utterance" if captured_utterance.barge_in_candidate else "ignoring overlapping short utterance"
-                    asr_logger.info("[bold blue]ASR[/] %s (%s)", log_label, rejection_reason)
+                    _log_transcript_judgement(
+                        asr_logger,
+                        label="barge-in" if captured_utterance.barge_in_candidate else "turn",
+                        payload=payload,
+                        transcript_text=transcript_text,
+                        accepted=False,
+                        rejection_reason=rejection_reason,
+                    )
                     continue
 
-            asr_logger.info("[bold blue]ASR[/] transcript %s", transcript_text)
+            _log_transcript_judgement(
+                asr_logger,
+                label="barge-in" if captured_utterance.barge_in_candidate else "turn",
+                payload=payload,
+                transcript_text=transcript_text,
+                accepted=True,
+            )
 
             if args.save_transcripts:
                 saved = asr_tools.save_output(payload, argparse.Namespace(**{**vars(_conversation_transcription_args(args)), "output": None, "save_output": True}), captured_utterance.audio)
@@ -1174,20 +1190,17 @@ async def conversation_loop(args: argparse.Namespace) -> int:
                     active_tools,
                     robot=robot,
                     assistant_speech_state=assistant_speech_state,
-                    runtime_settings=runtime_settings,
-                    expected_settings_version=settings_version,
                 )
                 if pending_utterance is not None:
                     llm_logger.info("[bold cyan]LLM[/] interrupted live reply because user speech was detected")
                     continue
-            except SpeechInterruptedError:
-                llm_logger.info("[bold cyan]LLM[/] interrupted live reply because settings changed")
-                continue
             except RuntimeError as exc:
                 if is_recoverable_llm_turn_error(exc):
                     llm_logger.warning("[bold cyan]LLM[/] turn aborted without reply: %s", exc)
                     continue
                 raise
+            if result is None:
+                continue
             llm_logger.info("[bold cyan]LLM[/] assistant %s", result.assistant_text)
 
             history.extend(

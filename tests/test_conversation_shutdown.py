@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from pipecat.frames.frames import OutputAudioRawFrame
 
 from gradio_ui import _free_gradio_port_if_same_uv_app, _is_same_conversation_app_process
-from main import _play_assistant_text, capture_robot_utterance, conversation_loop, is_recoverable_llm_turn_error
+from main import _play_assistant_text, _run_pipeline_with_barge_in, CapturedUtterance, capture_robot_utterance, conversation_loop, is_recoverable_llm_turn_error
 from pipeline import SpeechInterruptedError, _create_turn_pipeline_runner
 from state import RuntimeSettings as StateRuntimeSettings
 
@@ -36,6 +36,12 @@ class ConversationShutdownTests(unittest.TestCase):
             robot_host="reachy-mini.local",
             data_dir="/tmp/conversation-test-data",
             assistant_speaking_tail_ms=350,
+            assistant_speaking_threshold_boost=0.005,
+            assistant_speaking_vad_start_ms=400,
+            assistant_speaking_min_vad_ms=500,
+            assistant_speaking_min_chars=4,
+            assistant_speaking_interrupt_min_vad_ms=700,
+            assistant_speaking_interrupt_min_chars=6,
             gradio=False,
             wake_up=wake_up,
             motion_duration=0.8,
@@ -342,6 +348,7 @@ class ConversationShutdownTests(unittest.TestCase):
             assistant_speaking_threshold_boost=0.005,
             assistant_speaking_vad_start_ms=400,
             assistant_speaking_min_vad_ms=500,
+            assistant_speaking_interrupt_min_vad_ms=700,
             sample_rate=16000,
         )
         robot = MagicMock()
@@ -402,6 +409,70 @@ class ConversationShutdownTests(unittest.TestCase):
         audio_player.abort.assert_called_once_with()
         audio_player.close.assert_called_once_with()
         self.assertEqual(audio_player.process_frame.await_count, 1)
+
+    def test_run_pipeline_with_barge_in_returns_captured_utterance(self) -> None:
+        args = self._make_args(wake_up=False)
+        robot = self._make_robot()
+        runtime = MagicMock()
+        captured = CapturedUtterance(audio=MagicMock(), duration_ms=900.0, overlap_gate_active=True, barge_in_candidate=True)
+
+        async def run_turn_side_effect(*_args, **kwargs):
+            interrupt_event = kwargs["interrupt_event"]
+            while not interrupt_event.is_set():
+                await asyncio.sleep(0)
+            raise SpeechInterruptedError("assistant speech interrupted by user speech")
+
+        with (
+            patch("main.run_pipeline", side_effect=run_turn_side_effect),
+            patch("main.capture_robot_utterance", AsyncMock(return_value=captured)),
+        ):
+            result, barge_in = asyncio.run(
+                _run_pipeline_with_barge_in(
+                    args,
+                    runtime,
+                    "こんにちは",
+                    [],
+                    [],
+                    robot=robot,
+                    assistant_speech_state=MagicMock(),
+                )
+            )
+
+        self.assertIsNone(result)
+        self.assertIs(barge_in, captured)
+
+    def test_conversation_loop_reuses_barge_in_utterance_as_next_turn(self) -> None:
+        args = self._make_args(wake_up=False)
+        robot = self._make_robot()
+        runtime = MagicMock()
+        runtime.shutdown = AsyncMock()
+        first_utterance = CapturedUtterance(audio=MagicMock(name="first_audio"), duration_ms=800.0, overlap_gate_active=False)
+        barge_in_utterance = CapturedUtterance(audio=MagicMock(name="barge_audio"), duration_ms=900.0, overlap_gate_active=True, barge_in_candidate=True)
+        run_results: list[object] = [(None, barge_in_utterance), KeyboardInterrupt]
+
+        async def run_with_barge_in_side_effect(*_args, **_kwargs):
+            next_result = run_results.pop(0)
+            if next_result is KeyboardInterrupt:
+                raise KeyboardInterrupt
+            return next_result
+
+        transcribe_audio = AsyncMock(side_effect=[{"text": "最初の質問", "segments": []}, {"text": "ちょっと待って", "segments": []}])
+
+        with (
+            patch("main.resolve_runtime_models"),
+            patch("main.ReachyMini", return_value=robot),
+            patch("main.reachy_tools.ReachyToolRuntime", return_value=runtime),
+            patch("main._speak_persona_greeting", AsyncMock(return_value=[])),
+            patch("main.capture_robot_utterance", side_effect=[first_utterance, KeyboardInterrupt]),
+            patch("main.transcribe_captured_audio", transcribe_audio),
+            patch("main._run_pipeline_with_barge_in", side_effect=run_with_barge_in_side_effect),
+        ):
+            result = asyncio.run(conversation_loop(args))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(transcribe_audio.await_count, 2)
+        self.assertIs(transcribe_audio.await_args_list[0].args[1], first_utterance)
+        self.assertIs(transcribe_audio.await_args_list[1].args[1], barge_in_utterance)
 
     def test_conversation_loop_discards_live_reply_when_settings_change(self) -> None:
         args = self._make_args(wake_up=False)

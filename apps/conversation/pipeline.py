@@ -10,7 +10,6 @@ import queue
 import threading
 import time
 import uuid
-from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, cast
@@ -18,7 +17,12 @@ from urllib.parse import urlparse, urlunparse
 
 import httpx
 import numpy as np
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+try:
+    from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
+except ImportError:
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
+    AIMessageChunk = AIMessage
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 from pipecat.frames.frames import EndFrame, ErrorFrame, FunctionCallInProgressFrame, FunctionCallResultFrame, LLMContextFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame, OutputAudioRawFrame
@@ -34,6 +38,7 @@ from state import AssistantSpeechState, RuntimeSettings
 from websockets import connect as ws_connect
 
 from reachy_conversation_tools import ReachyToolRuntime, build_langchain_tools
+from tts_pronunciation_overrides import TTS_PRONUNCIATION_OVERRIDES
 
 TTS_TIMEOUT = float(os.environ.get("TTS_TIMEOUT", "600"))
 TTS_STREAM_CHUNK_BYTES = int(os.environ.get("TTS_STREAM_CHUNK_BYTES", "8192"))
@@ -74,6 +79,23 @@ def _content_text(content: Any) -> str:
                     parts.append(text)
         return "".join(parts)
     return str(content or "")
+
+
+def _extract_chunk_text(chunk: Any) -> str:
+    content = getattr(chunk, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
 
 
 def _to_langchain_messages(messages: list[Any]) -> list[Any]:
@@ -136,14 +158,18 @@ def _drain_ready_segments(
     *,
     final: bool,
     newline_threshold: int,
+    min_chars: int,
     max_chars: int,
 ) -> tuple[list[str], str]:
     segments: list[str] = []
     start = 0
     consecutive_newlines = 0
     english_like = _is_probably_english_text(buffer)
+    effective_min_chars = min_chars * 2 if english_like and min_chars > 0 else min_chars
     effective_max_chars = max_chars * 3 if english_like and max_chars > 0 else max_chars
-    split_punctuation = {"。", ".", ")"}
+    sentence_punctuation = {"。", "！", "？", ".", "!", "?", ")"}
+    hard_split_punctuation = {"。", ".", ")"}
+    enforce_min_chars = True
     for index, char in enumerate(buffer):
         if char == "\n":
             consecutive_newlines += 1
@@ -154,13 +180,18 @@ def _drain_ready_segments(
         should_split = False
         if newline_threshold > 0 and consecutive_newlines >= newline_threshold:
             should_split = True
-        elif effective_max_chars > 0 and len(segment.strip()) >= effective_max_chars and char in split_punctuation:
+        elif char in sentence_punctuation and (
+            not enforce_min_chars or effective_min_chars <= 0 or len(segment.strip()) >= effective_min_chars
+        ):
+            should_split = True
+        elif effective_max_chars > 0 and len(segment.strip()) >= effective_max_chars and char in hard_split_punctuation:
             should_split = True
 
         if should_split:
             segment = segment.strip()
             if segment:
                 segments.append(segment)
+                enforce_min_chars = False
             start = index + 1
             consecutive_newlines = 0
 
@@ -171,6 +202,13 @@ def _drain_ready_segments(
             segments.append(tail)
         remainder = ""
     return segments, remainder
+
+
+def _normalize_tts_text(text: str) -> str:
+    normalized = text
+    for source in sorted(TTS_PRONUNCIATION_OVERRIDES, key=len, reverse=True):
+        normalized = normalized.replace(source, TTS_PRONUNCIATION_OVERRIDES[source])
+    return normalized
 
 
 def _pcm16_to_float32(audio_bytes: bytes, num_channels: int) -> np.ndarray:
@@ -364,7 +402,7 @@ class ReachyLangChainProcessor(FrameProcessor):
         super().__init__(name="ReachyLangChainProcessor")
         self._logger = logging.getLogger("conversation.llm")
         self._tools_by_name = {tool.name: tool for tool in tools}
-        self._model = ChatOpenAI(
+        base_model = ChatOpenAI(
             model=args.chat_model,
             base_url=args.chat_base_url,
             api_key=SecretStr(args.chat_api_key),
@@ -372,22 +410,52 @@ class ReachyLangChainProcessor(FrameProcessor):
             max_completion_tokens=args.max_completion_tokens,
             use_responses_api=False,
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        ).bind_tools(tools)
+        )
+        self._tool_model = base_model.bind_tools(tools)
+        self._response_model = base_model
         self._system_prompt = args.system_prompt
         self._max_tool_rounds = args.max_tool_rounds
 
-    async def _follow_up_for_tool_use(self, messages: list[Any]):
-        return await self._model.ainvoke(
+    async def _select_tool_use(self, messages: list[Any]):
+        return await self._tool_model.ainvoke(
             [
                 *messages,
                 HumanMessage(
                     content=(
-                        "Call a tool now only if one is still needed to continue this reply. "
+                        "Decide whether a tool call is required to answer the user's last request. "
+                        "If a tool is needed, call it now. "
                         f"If no tool call is needed, reply with exactly {TOOL_CHECK_SENTINEL}."
                     )
                 ),
             ]
         )
+
+    async def _stream_final_response(self, messages: list[Any], direction: FrameDirection) -> None:
+        emitted_text = False
+        try:
+            async for chunk in self._response_model.astream(messages):
+                if not isinstance(chunk, AIMessageChunk):
+                    continue
+                text = _extract_chunk_text(chunk)
+                if not text:
+                    continue
+                emitted_text = True
+                await self.push_frame(LLMTextFrame(text=text), direction)
+        except Exception as exc:
+            self._logger.warning("[bold yellow]LLM[/] streaming failed, falling back to buffered response: %s", exc)
+            response = await self._response_model.ainvoke(messages)
+            text = _content_text(response.content).strip()
+            if text:
+                await self.push_frame(LLMTextFrame(text=text), direction)
+            return
+
+        if emitted_text:
+            return
+
+        response = await self._response_model.ainvoke(messages)
+        text = _content_text(response.content).strip()
+        if text:
+            await self.push_frame(LLMTextFrame(text=text), direction)
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -400,29 +468,23 @@ class ReachyLangChainProcessor(FrameProcessor):
         await self.push_frame(LLMFullResponseStartFrame(), direction)
 
         try:
+            if not self._tools_by_name:
+                await self._stream_final_response(messages, direction)
+                return
+
             for round_index in range(self._max_tool_rounds):
                 self._logger.info("[bold cyan]LLM[/] round %d", round_index + 1)
-                response = await self._model.ainvoke(messages)
+                response = await self._select_tool_use(messages)
                 text = _content_text(response.content).strip()
                 tool_calls = getattr(response, "tool_calls", None) or []
-                messages.append(response)
-
-                if not tool_calls and text and self._tools_by_name:
-                    self._logger.info("[bold cyan]LLM[/] tool follow-up check")
-                    follow_up = await self._follow_up_for_tool_use(messages)
-                    follow_up_tool_calls = getattr(follow_up, "tool_calls", None) or []
-                    if follow_up_tool_calls:
-                        response = follow_up
-                        tool_calls = follow_up_tool_calls
-                        messages.append(follow_up)
-                    else:
-                        self._logger.debug("Tool follow-up check ended without a tool call")
 
                 if not tool_calls:
-                    if text:
-                        await self.push_frame(LLMTextFrame(text=text), direction)
+                    if text and text != TOOL_CHECK_SENTINEL:
+                        self._logger.debug("Tool decision returned non-sentinel text without tool call: %r", text)
+                    await self._stream_final_response(messages, direction)
                     break
 
+                messages.append(response)
                 group_id = uuid.uuid4().hex
                 for tool_call in tool_calls:
                     tool_name = str(tool_call.get("name") or "")
@@ -472,6 +534,7 @@ class ReachyTTSProcessor(FrameProcessor):
         self._segment_queue: asyncio.Queue[str | None] | None = None
         self._worker_task: asyncio.Task[None] | None = None
         self._interrupt_event = asyncio.Event()
+        self._stream_has_started = False
 
     async def request_interrupt(self) -> None:
         self._interrupt_event.set()
@@ -538,6 +601,7 @@ class ReachyTTSProcessor(FrameProcessor):
             self._logger.info("[bold green]TTS[/] response stream started")
             self._pending_text = ""
             self._interrupt_event.clear()
+            self._stream_has_started = False
             self._segment_queue = asyncio.Queue()
             self._worker_task = asyncio.create_task(self._tts_worker(direction))
             await self.push_frame(frame, direction)
@@ -549,31 +613,41 @@ class ReachyTTSProcessor(FrameProcessor):
                 return
             if frame.text:
                 self._pending_text += frame.text
+                min_chars = self._args.tts_segment_min_chars if not self._stream_has_started else 0
                 segments, remainder = _drain_ready_segments(
                     self._pending_text,
                     final=False,
                     newline_threshold=self._args.tts_segment_newline_threshold,
+                    min_chars=min_chars,
                     max_chars=self._args.tts_segment_max_chars,
                 )
                 self._pending_text = remainder
                 if self._segment_queue is not None:
                     for segment in segments:
-                        await self._segment_queue.put(segment)
+                        normalized_segment = _normalize_tts_text(segment)
+                        await self._segment_queue.put(normalized_segment)
+                    if segments:
+                        self._stream_has_started = True
             await self.push_frame(frame, direction)
             return
 
         if isinstance(frame, LLMFullResponseEndFrame):
             if self._segment_queue is not None:
                 if not self._interrupt_event.is_set():
+                    min_chars = self._args.tts_segment_min_chars if not self._stream_has_started else 0
                     segments, remainder = _drain_ready_segments(
                         self._pending_text,
                         final=True,
                         newline_threshold=self._args.tts_segment_newline_threshold,
+                        min_chars=min_chars,
                         max_chars=self._args.tts_segment_max_chars,
                     )
                     self._pending_text = remainder
                     for segment in segments:
-                        await self._segment_queue.put(segment)
+                        normalized_segment = _normalize_tts_text(segment)
+                        await self._segment_queue.put(normalized_segment)
+                    if segments:
+                        self._stream_has_started = True
                     await self._segment_queue.join()
                 await self._stop_worker()
             self._logger.info("[bold green]TTS[/] response stream finished")
@@ -871,7 +945,7 @@ async def run_pipeline(
     task = PipelineTask(
         pipeline,
         params=PipelineParams(audio_in_sample_rate=args.sample_rate, audio_out_sample_rate=args.tts_sample_rate),
-        idle_timeout_secs=60,
+        idle_timeout_secs=max(1.0, float(getattr(args, "turn_idle_timeout_seconds", 120.0))),
     )
     terminator.bind_task(task)
     runner = _create_turn_pipeline_runner()

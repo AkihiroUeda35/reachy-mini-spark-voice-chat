@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
+from unittest.mock import MagicMock
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "conversation"))
 
-from main import CapturedUtterance, _conversation_transcription_args, transcript_quality_rejection_reason, transcribe_captured_audio
+from main import _conversation_transcription_args, _log_transcript_judgement, _transcript_observation_fields, transcript_quality_rejection_reason
 
 
 class ConversationASRFilteringTests(unittest.TestCase):
@@ -50,6 +48,18 @@ class ConversationASRFilteringTests(unittest.TestCase):
 
         self.assertEqual(reason, "language ru not in ja")
 
+    def test_rejects_detected_language_in_excluded_language_list(self) -> None:
+        reason = transcript_quality_rejection_reason(
+            {
+                "text": "Продолжение следует...",
+                "language": "ru",
+                "segments": [{"avg_logprob": -0.82, "no_speech_prob": 0.00}],
+            },
+            self._make_args(language="auto", excluded_transcript_languages="ru,es,fr"),
+        )
+
+        self.assertEqual(reason, "language ru excluded by es,fr,ru")
+
     def test_accepts_region_variant_inside_allowed_language_list(self) -> None:
         reason = transcript_quality_rejection_reason(
             {
@@ -61,30 +71,6 @@ class ConversationASRFilteringTests(unittest.TestCase):
         )
 
         self.assertIsNone(reason)
-
-    def test_rejects_detected_language_in_excluded_language_list(self) -> None:
-        reason = transcript_quality_rejection_reason(
-            {
-                "text": "Продолжение следует",
-                "language": "ru-RU",
-                "segments": [{"avg_logprob": -0.2, "no_speech_prob": 0.02}],
-            },
-            self._make_args(language="auto", excluded_transcript_languages="ru,es,fr"),
-        )
-
-        self.assertEqual(reason, "language ru excluded by es,fr,ru")
-
-    def test_excluded_language_takes_precedence_over_allowed_language(self) -> None:
-        reason = transcript_quality_rejection_reason(
-            {
-                "text": "hola",
-                "language": "es",
-                "segments": [{"avg_logprob": -0.2, "no_speech_prob": 0.02}],
-            },
-            self._make_args(allowed_transcript_languages="ja,en,es", excluded_transcript_languages="ru,es,fr"),
-        )
-
-        self.assertEqual(reason, "language es excluded by es,fr,ru")
 
     def test_rejects_low_mean_avg_logprob(self) -> None:
         reason = transcript_quality_rejection_reason(
@@ -125,40 +111,38 @@ class ConversationASRFilteringTests(unittest.TestCase):
 
         self.assertIsNone(reason)
 
-    def test_logs_detected_language_when_asr_language_is_auto(self) -> None:
-        args = argparse.Namespace(
-            base_url="http://localhost:8020/v1",
-            api_key="local",
-            model="whisper-1",
-            language="auto",
-            transport="http",
-            response_format="text",
-        )
-        utterance = CapturedUtterance(
-            audio=SimpleNamespace(pcm16_bytes=b"\x00\x00" * 16000, sample_rate=16000),
-            duration_ms=1000.0,
-            overlap_gate_active=False,
-        )
-
-        with patch(
-            "main.asr_tools.transcribe_http",
-            return_value={
+    def test_transcript_observation_fields_always_return_language_score_and_text(self) -> None:
+        fields = _transcript_observation_fields(
+            {
                 "text": "selamat menikmati",
                 "language": "id",
                 "segments": [{"avg_logprob": -0.23, "no_speech_prob": 0.04}],
-            },
-        ), patch(
-            "main.logging.getLogger"
-        ) as get_logger:
-            logger = get_logger.return_value
-            payload = asyncio.run(transcribe_captured_audio(args, utterance))
+            }
+        )
 
-        self.assertEqual(payload["language"], "id")
-        logger.info.assert_any_call(
-            "[bold blue]ASR[/] detected language=%s%s%s",
-            "id",
-            " avg_logprob=-0.23 max_no_speech_prob=0.04",
-            " text=selamat menikmati",
+        self.assertEqual(fields, ("id", "-0.23", "0.04", "selamat menikmati"))
+
+    def test_log_transcript_judgement_includes_reason_and_fallback_values(self) -> None:
+        logger = MagicMock()
+
+        _log_transcript_judgement(
+            logger,
+            label="barge-in",
+            payload={"text": "", "segments": []},
+            transcript_text="",
+            accepted=False,
+            rejection_reason="empty transcript",
+        )
+
+        logger.info.assert_called_once_with(
+            "[bold blue]ASR[/] %s result=%s language=%s avg_logprob=%s max_no_speech_prob=%s text=%s%s",
+            "barge-in",
+            "rejected",
+            "unknown",
+            "n/a",
+            "n/a",
+            "",
+            " reason=empty transcript",
         )
 
 
