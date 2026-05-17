@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import signal
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import main
 from pipecat.frames.frames import OutputAudioRawFrame
 
 from gradio_ui import _free_gradio_port_if_same_uv_app, _is_same_conversation_app_process
@@ -70,6 +72,68 @@ class ConversationShutdownTests(unittest.TestCase):
 
     def test_recoverable_llm_turn_error_ignores_unrelated_failures(self) -> None:
         self.assertFalse(is_recoverable_llm_turn_error(RuntimeError("TTS returned no audio.")))
+
+    def test_parse_args_defaults_robot_host_from_env_setting(self) -> None:
+        with (
+            patch.object(main, "REACHY_HOST", "192.168.0.42"),
+            patch.object(sys, "argv", ["main.py"]),
+        ):
+            args = main.parse_args()
+
+        self.assertEqual(args.robot_host, "192.168.0.42")
+
+    def test_reachy_daemon_http_base_url_defaults_to_port_8000(self) -> None:
+        self.assertEqual(main._reachy_daemon_http_base_url("reachy"), "http://reachy:8000")
+        self.assertEqual(main._reachy_daemon_http_base_url("http://reachy:8000/path"), "http://reachy:8000")
+
+    def test_connect_robot_requests_remote_daemon_start_and_retries(self) -> None:
+        args = self._make_args(wake_up=True)
+        args.robot_host = "reachy"
+        robot = self._make_robot()
+        app_logger = MagicMock()
+
+        async_to_thread = AsyncMock(return_value=None)
+        async_sleep = AsyncMock(return_value=None)
+
+        with (
+            patch("main.ReachyMini", side_effect=[ConnectionError("daemon unavailable"), robot]) as reachy_cls,
+            patch("main.asyncio.to_thread", async_to_thread),
+            patch("main.asyncio.sleep", async_sleep),
+        ):
+            result = asyncio.run(main._connect_robot(args, {"host": "reachy"}, app_logger))
+
+        self.assertIs(result, robot)
+        self.assertEqual(reachy_cls.call_count, 2)
+        async_to_thread.assert_awaited_once_with(main._request_remote_daemon_start, "http://reachy:8000", wake_up=True)
+        async_sleep.assert_awaited_once_with(1.0)
+
+    def test_connect_robot_retries_while_webrtc_producer_is_registering(self) -> None:
+        args = self._make_args(wake_up=True)
+        args.robot_host = "reachy"
+        robot = self._make_robot()
+        app_logger = MagicMock()
+
+        async_to_thread = AsyncMock(return_value=None)
+        async_sleep = AsyncMock(return_value=None)
+
+        with (
+            patch(
+                "main.ReachyMini",
+                side_effect=[
+                    ConnectionError("daemon unavailable"),
+                    KeyError("Producer reachymini not found."),
+                    robot,
+                ],
+            ) as reachy_cls,
+            patch("main.asyncio.to_thread", async_to_thread),
+            patch("main.asyncio.sleep", async_sleep),
+        ):
+            result = asyncio.run(main._connect_robot(args, {"host": "reachy"}, app_logger))
+
+        self.assertIs(result, robot)
+        self.assertEqual(reachy_cls.call_count, 3)
+        async_to_thread.assert_awaited_once_with(main._request_remote_daemon_start, "http://reachy:8000", wake_up=True)
+        self.assertEqual(async_sleep.await_count, 2)
 
     @patch("pipeline.PipelineRunner")
     def test_create_turn_pipeline_runner_disables_signal_handlers(self, mock_runner) -> None:
@@ -417,6 +481,7 @@ class ConversationShutdownTests(unittest.TestCase):
         captured = CapturedUtterance(audio=MagicMock(), duration_ms=900.0, overlap_gate_active=True, barge_in_candidate=True)
 
         async def run_turn_side_effect(*_args, **kwargs):
+            kwargs["llm_finished_event"].set()
             interrupt_event = kwargs["interrupt_event"]
             while not interrupt_event.is_set():
                 await asyncio.sleep(0)

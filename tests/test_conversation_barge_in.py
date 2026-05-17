@@ -87,6 +87,7 @@ class ConversationBargeInTests(unittest.TestCase):
         captured = CapturedUtterance(audio=MagicMock(), duration_ms=900.0, overlap_gate_active=True, barge_in_candidate=True)
 
         async def run_turn_side_effect(*_args, **kwargs):
+            kwargs["llm_finished_event"].set()
             interrupt_event = kwargs["interrupt_event"]
             while not interrupt_event.is_set():
                 await asyncio.sleep(0)
@@ -119,6 +120,7 @@ class ConversationBargeInTests(unittest.TestCase):
         captured = CapturedUtterance(audio=MagicMock(), duration_ms=900.0, overlap_gate_active=True, barge_in_candidate=True)
 
         async def speak_side_effect(*_args, **kwargs):
+            kwargs["barge_in_ready_event"].set()
             interrupt_event = kwargs["interrupt_event"]
             while not interrupt_event.is_set():
                 await asyncio.sleep(0)

@@ -397,6 +397,18 @@ class RichTraceProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class LLMCompletionSignalProcessor(FrameProcessor):
+    def __init__(self, llm_finished_event: asyncio.Event | None = None):
+        super().__init__(name="LLMCompletionSignalProcessor")
+        self._llm_finished_event = llm_finished_event
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMFullResponseEndFrame) and self._llm_finished_event is not None:
+            self._llm_finished_event.set()
+        await self.push_frame(frame, direction)
+
+
 class ReachyLangChainProcessor(FrameProcessor):
     def __init__(self, args: argparse.Namespace, tools: list[BaseTool]):
         super().__init__(name="ReachyLangChainProcessor")
@@ -928,10 +940,12 @@ async def run_pipeline(
     runtime_settings: RuntimeSettings | None = None,
     expected_settings_version: int | None = None,
     interrupt_event: asyncio.Event | None = None,
+    llm_finished_event: asyncio.Event | None = None,
     interrupt_reason: str = "assistant speech interrupted",
 ) -> PipelineResult:
     tools = build_langchain_tools(runtime, enabled_tool_names)
     llm = ReachyLangChainProcessor(args, tools)
+    completion_signal = LLMCompletionSignalProcessor(llm_finished_event)
     trace = RichTraceProcessor()
     tts = ReachyTTSProcessor(args)
     collector = ResultCollector()
@@ -941,7 +955,7 @@ async def run_pipeline(
         assistant_speech_state=assistant_speech_state,
     )
     terminator = PipelineTerminator()
-    pipeline = Pipeline([llm, trace, tts, collector, audio_player, terminator])
+    pipeline = Pipeline([llm, completion_signal, trace, tts, collector, audio_player, terminator])
     task = PipelineTask(
         pipeline,
         params=PipelineParams(audio_in_sample_rate=args.sample_rate, audio_out_sample_rate=args.tts_sample_rate),

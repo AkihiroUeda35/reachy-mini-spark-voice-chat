@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import wave
 import json
 from collections import deque
@@ -16,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import numpy as np
@@ -64,6 +66,8 @@ TTS_SEGMENT_MIN_CHARS = int(os.environ.get("TTS_SEGMENT_MIN_CHARS", "0"))
 TTS_SEGMENT_MAX_CHARS = int(os.environ.get("TTS_SEGMENT_MAX_CHARS", "100"))
 TURN_IDLE_TIMEOUT_SECONDS = float(os.environ.get("TURN_IDLE_TIMEOUT_SECONDS", "120"))
 SHUTDOWN_STEP_TIMEOUT_S = 2.0
+REACHY_HOST = os.environ.get("REACHY_HOST", "reachy-mini.local")
+REACHY_DAEMON_START_TIMEOUT_S = float(os.environ.get("REACHY_DAEMON_START_TIMEOUT_S", "5.0"))
 ASR_MIN_SEGMENT_AVG_LOGPROB = float(os.environ.get("ASR_MIN_SEGMENT_AVG_LOGPROB", "-0.75"))
 ASR_MAX_SEGMENT_NO_SPEECH_PROB = float(os.environ.get("ASR_MAX_SEGMENT_NO_SPEECH_PROB", "0.6"))
 ASR_ALLOWED_LANGUAGES = os.environ.get("ASR_ALLOWED_LANGUAGES", "")
@@ -110,6 +114,79 @@ def _parse_transcript_languages(raw_value: str | None) -> set[str]:
 
 def _conversation_transcription_args(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(**{**vars(args), "response_format": "verbose_json"})
+
+
+def _reachy_daemon_http_base_url(robot_host: str | None) -> str | None:
+    host = str(robot_host or "").strip()
+    if not host:
+        return None
+    if "://" not in host:
+        return f"http://{host}:8000"
+
+    parsed = urlparse(host)
+    if parsed.netloc:
+        return f"{parsed.scheme or 'http'}://{parsed.netloc}"
+    if parsed.path:
+        return f"{parsed.scheme or 'http'}://{parsed.path}"
+    return None
+
+
+def _request_remote_daemon_start(daemon_base_url: str, *, wake_up: bool, timeout_s: float = 5.0) -> None:
+    response = httpx.post(
+        f"{daemon_base_url.rstrip('/')}/api/daemon/start",
+        params={"wake_up": str(wake_up).lower()},
+        timeout=timeout_s,
+    )
+    response.raise_for_status()
+
+
+def _is_transient_reachy_startup_error(exc: Exception) -> bool:
+    if isinstance(exc, ConnectionError | TimeoutError):
+        return True
+    if isinstance(exc, KeyError) and "Producer reachymini not found." in str(exc):
+        return True
+    return False
+
+
+async def _connect_robot(
+    args: argparse.Namespace,
+    robot_kwargs: dict[str, Any],
+    app_logger: logging.Logger,
+) -> ReachyMini:
+    try:
+        return ReachyMini(**robot_kwargs)
+    except Exception as exc:
+        if not _is_transient_reachy_startup_error(exc):
+            raise
+        daemon_base_url = _reachy_daemon_http_base_url(getattr(args, "robot_host", None))
+        if not args.wake_up or daemon_base_url is None:
+            raise
+
+        app_logger.warning(
+            "Reachy daemon was not reachable over SDK; requesting remote daemon start via %s",
+            daemon_base_url,
+        )
+
+        try:
+            await asyncio.to_thread(_request_remote_daemon_start, daemon_base_url, wake_up=True)
+        except Exception:
+            app_logger.exception("Failed to request remote Reachy daemon start")
+            raise exc
+
+        deadline = time.monotonic() + REACHY_DAEMON_START_TIMEOUT_S
+        last_error: Exception = exc
+        while time.monotonic() < deadline:
+            await asyncio.sleep(1.0)
+            try:
+                robot = ReachyMini(**robot_kwargs)
+                app_logger.info("Remote Reachy daemon became available after wake request")
+                return robot
+            except Exception as retry_exc:
+                if not _is_transient_reachy_startup_error(retry_exc):
+                    raise
+                last_error = retry_exc
+
+        raise last_error
 
 
 def _segment_metric_summary(payload: dict[str, Any]) -> tuple[float | None, float | None]:
@@ -332,8 +409,11 @@ async def _speak_persona_greeting(
     reason: str,
     assistant_speech_state: AssistantSpeechState | None = None,
     interrupt_event: asyncio.Event | None = None,
+    barge_in_ready_event: asyncio.Event | None = None,
 ) -> list[dict[str, str]]:
     greeting = await _generate_persona_greeting(args, reason=reason)
+    if barge_in_ready_event is not None:
+        barge_in_ready_event.set()
     logging.getLogger("conversation.llm").info("[bold cyan]LLM[/] greeting %s", greeting)
     await _play_assistant_text(
         args,
@@ -359,6 +439,7 @@ def configure_logging(debug: bool) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reachy Mini conversation app powered by local ASR, LLM, and TTS servers.")
+    parser.add_argument("--robot-host", default=REACHY_HOST or None, help="Reachy Mini host or IP address. Defaults to REACHY_HOST from the environment when set.")
     parser.add_argument("--robot-name", help="Optional Reachy Mini robot name when multiple robots are available.")
     parser.add_argument("--profile", help="Profile name under apps/conversation/profiles. Defaults to the last saved selection, or 'default'.")
     parser.add_argument("--profiles-dir", default=str(APP_DIR / "profiles"), help="Directory containing profile folders.")
@@ -811,8 +892,11 @@ async def _capture_barge_in_utterance(
     args: argparse.Namespace,
     *,
     assistant_speech_state: AssistantSpeechState,
+    start_event: asyncio.Event | None = None,
 ) -> CapturedUtterance | None:
     asr_logger = logging.getLogger("conversation.asr")
+    if start_event is not None:
+        await start_event.wait()
     while True:
         utterance = await capture_robot_utterance(
             robot,
@@ -889,6 +973,7 @@ async def _speak_persona_greeting_with_barge_in(
     assistant_speech_state: AssistantSpeechState,
 ) -> tuple[list[dict[str, str]], CapturedUtterance | None]:
     interrupt_event = asyncio.Event()
+    barge_in_ready_event = asyncio.Event()
     greeting_task = asyncio.create_task(
         _speak_persona_greeting(
             args,
@@ -897,6 +982,7 @@ async def _speak_persona_greeting_with_barge_in(
             reason=reason,
             assistant_speech_state=assistant_speech_state,
             interrupt_event=interrupt_event,
+            barge_in_ready_event=barge_in_ready_event,
         )
     )
     barge_in_task = asyncio.create_task(
@@ -904,6 +990,7 @@ async def _speak_persona_greeting_with_barge_in(
             robot,
             args,
             assistant_speech_state=assistant_speech_state,
+            start_event=barge_in_ready_event,
         )
     )
     try:
@@ -944,6 +1031,7 @@ async def _run_pipeline_with_barge_in(
     assistant_speech_state: AssistantSpeechState,
 ) -> tuple[PipelineResult | None, CapturedUtterance | None]:
     interrupt_event = asyncio.Event()
+    barge_in_ready_event = asyncio.Event()
     reply_task = asyncio.create_task(
         run_pipeline(
             args,
@@ -953,6 +1041,7 @@ async def _run_pipeline_with_barge_in(
             active_tools,
             assistant_speech_state=assistant_speech_state,
             interrupt_event=interrupt_event,
+            llm_finished_event=barge_in_ready_event,
             interrupt_reason="assistant speech interrupted by user speech",
         )
     )
@@ -961,6 +1050,7 @@ async def _run_pipeline_with_barge_in(
             robot,
             args,
             assistant_speech_state=assistant_speech_state,
+            start_event=barge_in_ready_event,
         )
     )
     try:
@@ -1019,6 +1109,8 @@ async def conversation_loop(args: argparse.Namespace) -> int:
     )
 
     robot_kwargs: dict[str, Any] = {}
+    if args.robot_host:
+        robot_kwargs["host"] = args.robot_host
     if args.robot_name:
         robot_kwargs["robot_name"] = args.robot_name
 
@@ -1052,7 +1144,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
     app_logger.info("[bold]Starting Reachy Mini conversation app[/]")
     app_logger.info("Profile=%s chat_model=%s stt_model=%s tts_model=%s", args.profile, args.chat_model, args.model, args.tts_model)
 
-    robot = ReachyMini(**robot_kwargs)
+    robot = await _connect_robot(args, robot_kwargs, app_logger)
     robot.enable_motors()
     runtime = reachy_tools.ReachyToolRuntime(
         robot,
