@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import main
 from pipecat.frames.frames import OutputAudioRawFrame
 
-from gradio_ui import _free_gradio_port_if_same_uv_app, _is_same_conversation_app_process
+from gradio_ui import _free_gradio_port_if_same_uv_app, _is_same_conversation_app_process, _load_robot_audio_levels, _reachy_daemon_http_base_url, _write_robot_audio_level
 from main import _play_assistant_text, _run_pipeline_with_barge_in, CapturedUtterance, capture_robot_utterance, conversation_loop, is_recoverable_llm_turn_error
 from pipeline import SpeechInterruptedError, _create_turn_pipeline_runner
 from state import RuntimeSettings as StateRuntimeSettings
@@ -85,6 +85,43 @@ class ConversationShutdownTests(unittest.TestCase):
     def test_reachy_daemon_http_base_url_defaults_to_port_8000(self) -> None:
         self.assertEqual(main._reachy_daemon_http_base_url("reachy"), "http://reachy:8000")
         self.assertEqual(main._reachy_daemon_http_base_url("http://reachy:8000/path"), "http://reachy:8000")
+
+    def test_gradio_reachy_daemon_http_base_url_defaults_to_port_8000(self) -> None:
+        self.assertEqual(_reachy_daemon_http_base_url("reachy"), "http://reachy:8000")
+        self.assertEqual(_reachy_daemon_http_base_url("http://reachy:8000/path"), "http://reachy:8000")
+
+    def test_load_robot_audio_levels_reads_speaker_and_microphone(self) -> None:
+        volume_response = MagicMock()
+        volume_response.raise_for_status = MagicMock()
+        volume_response.json.return_value = {"volume": 35, "platform": "linux", "device": "speaker"}
+        microphone_response = MagicMock()
+        microphone_response.raise_for_status = MagicMock()
+        microphone_response.json.return_value = {"volume": 64, "platform": "linux", "device": "mic"}
+
+        with patch("gradio_ui.httpx.get", side_effect=[volume_response, microphone_response]) as http_get:
+            volume, volume_status, microphone, microphone_status = _load_robot_audio_levels("reachy")
+
+        self.assertEqual(volume, 35)
+        self.assertEqual(microphone, 64)
+        self.assertIn("35%", volume_status)
+        self.assertIn("64%", microphone_status)
+        self.assertEqual(http_get.call_count, 2)
+
+    def test_write_robot_audio_level_clamps_percent_before_post(self) -> None:
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json.return_value = {"volume": 100, "platform": "linux", "device": "speaker"}
+
+        with patch("gradio_ui.httpx.post", return_value=response) as http_post:
+            volume, status = _write_robot_audio_level("reachy", "/set", "Volume Control", 132)
+
+        self.assertEqual(volume, 100)
+        self.assertIn("100%", status)
+        http_post.assert_called_once_with(
+            "http://reachy:8000/api/volume/set",
+            json={"volume": 100},
+            timeout=2.0,
+        )
 
     def test_connect_robot_requests_remote_daemon_start_and_retries(self) -> None:
         args = self._make_args(wake_up=True)
@@ -377,6 +414,55 @@ class ConversationShutdownTests(unittest.TestCase):
                     character,
                     instructions,
                     next_voice,
+                    qwen_voice,
+                    tts_instructions,
+                    greeting_reason="character update",
+                )
+                created_settings["updated"] = settings
+                return None
+            raise KeyboardInterrupt
+
+        with (
+            patch("main.resolve_runtime_models"),
+            patch("main.ReachyMini", return_value=robot),
+            patch("main.RuntimeSettings", side_effect=make_runtime_settings),
+            patch("main.reachy_tools.ReachyToolRuntime", return_value=runtime),
+            patch("main._speak_persona_greeting", speak_greeting),
+            patch("main.capture_robot_utterance", side_effect=capture_side_effect),
+        ):
+            result = asyncio.run(conversation_loop(args))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(speak_greeting.await_count, 2)
+        self.assertEqual(speak_greeting.await_args_list[0].kwargs["reason"], "startup")
+        self.assertEqual(speak_greeting.await_args_list[1].kwargs["reason"], "character update")
+
+    def test_conversation_loop_forces_greeting_after_live_apply_without_persona_change(self) -> None:
+        args = self._make_args(wake_up=False)
+        robot = self._make_robot()
+        runtime = MagicMock()
+        runtime.shutdown = AsyncMock()
+        speak_greeting = AsyncMock(side_effect=[
+            [{"role": "assistant", "content": "こんにちは。"}],
+            [{"role": "assistant", "content": "設定を反映しました。"}],
+        ])
+        created_settings: dict[str, StateRuntimeSettings] = {}
+
+        def make_runtime_settings(*args, **kwargs):
+            settings = StateRuntimeSettings(*args, **kwargs)
+            created_settings["value"] = settings
+            return settings
+
+        async def capture_side_effect(*_args, **_kwargs):
+            if "updated" not in created_settings:
+                settings = created_settings["value"]
+                profile, tools, character, instructions, _voice, qwen_voice, tts_instructions, _version = settings.snapshot()
+                settings.update(
+                    profile,
+                    tools,
+                    character,
+                    instructions,
+                    "audio_ref",
                     qwen_voice,
                     tts_instructions,
                     greeting_reason="character update",

@@ -228,6 +228,7 @@ class TTSBackendSwitchTests(unittest.TestCase):
                 model="tts-1",
                 input="Hello Reachy, this is an English test.",
                 voice="default",
+                task_type="Base",
                 language="English",
                 stream=False,
             )
@@ -236,6 +237,27 @@ class TTSBackendSwitchTests(unittest.TestCase):
             payload = VOICE_SERVER._tts_request_payload(request, response_format="wav", stream=False, backend="qwen3-tts")
 
         self.assertEqual(payload["model"], "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+
+    def test_english_custom_voice_request_keeps_tsukasa_backend(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TTS_BACKEND": "tsukasa-speech",
+            },
+            clear=False,
+        ):
+            request = VOICE_SERVER.SpeechRequest(
+                model="tts-1",
+                input="Certainly, my lord.",
+                voice="default",
+                task_type="CustomVoice",
+                language="English",
+                ref_audio={"tsukasa-speech": "data:audio/wav;base64,AAAA", "qwen3-tts": "data:audio/wav;base64,BBBB"},
+                ref_text={"qwen3-tts": "hello there"},
+                stream=False,
+            )
+
+            self.assertEqual(VOICE_SERVER._tts_backend_for_request(request), "tsukasa-speech")
 
     def test_qwen_request_uses_backend_specific_ref_audio_and_auto_base_mode(self) -> None:
         with patch.dict(

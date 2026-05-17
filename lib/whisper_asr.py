@@ -38,8 +38,8 @@ ASR_REALTIME_CHUNK_MS = 250
 ASR_VAD_THRESHOLD = 0.012
 ASR_VAD_FRAME_MS = 30
 ASR_VAD_START_MS = 90
-ASR_VAD_END_MS = 900
-ASR_VAD_PREROLL_MS = 450
+ASR_VAD_END_MS = 500
+ASR_VAD_PREROLL_MS = 250
 ASR_VAD_MAX_SECONDS = 20.0
 
 
@@ -63,8 +63,8 @@ def refresh_settings() -> None:
     ASR_VAD_THRESHOLD = float(os.environ.get("ASR_VAD_THRESHOLD", "0.012"))
     ASR_VAD_FRAME_MS = int(os.environ.get("ASR_VAD_FRAME_MS", "30"))
     ASR_VAD_START_MS = int(os.environ.get("ASR_VAD_START_MS", "90"))
-    ASR_VAD_END_MS = int(os.environ.get("ASR_VAD_END_MS", "900"))
-    ASR_VAD_PREROLL_MS = int(os.environ.get("ASR_VAD_PREROLL_MS", "450"))
+    ASR_VAD_END_MS = int(os.environ.get("ASR_VAD_END_MS", "500"))
+    ASR_VAD_PREROLL_MS = int(os.environ.get("ASR_VAD_PREROLL_MS", "250"))
     ASR_VAD_MAX_SECONDS = float(os.environ.get("ASR_VAD_MAX_SECONDS", "20"))
 
 

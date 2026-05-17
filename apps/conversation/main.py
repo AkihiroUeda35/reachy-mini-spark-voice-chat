@@ -1173,9 +1173,12 @@ async def conversation_loop(args: argparse.Namespace) -> int:
 
         while not stop_event.is_set():
             active_profile, active_tools, _active_character_prompt, active_instructions, active_voice, active_qwen_voice, active_tts_instructions, settings_version = runtime_settings.snapshot()
+            live_greeting_reason = None
             if settings_version != last_settings_version:
                 history.clear()
+                pending_utterance = None
                 last_settings_version = settings_version
+                live_greeting_reason = runtime_settings.consume_pending_greeting_reason()
                 app_logger.info("[bold]Conversation history reset[/] profile=%s", active_profile)
             args.profile = active_profile
             args.system_prompt = active_instructions
@@ -1186,7 +1189,16 @@ async def conversation_loop(args: argparse.Namespace) -> int:
             args.tts_instructions = active_tts_instructions
             _apply_profile_tts_prompt_assets(args, profiles_dir, active_profile)
             next_persona_signature = (active_profile, active_instructions)
-            if next_persona_signature != current_persona_signature:
+            if live_greeting_reason is not None:
+                history, pending_utterance = await _speak_persona_greeting_with_barge_in(
+                    args,
+                    robot,
+                    history,
+                    reason=live_greeting_reason,
+                    assistant_speech_state=assistant_speech_state,
+                )
+                current_persona_signature = next_persona_signature
+            elif next_persona_signature != current_persona_signature:
                 history, pending_utterance = await _speak_persona_greeting_with_barge_in(
                     args,
                     robot,

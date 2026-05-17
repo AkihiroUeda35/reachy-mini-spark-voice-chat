@@ -7,8 +7,11 @@ import signal
 import subprocess
 from contextlib import suppress
 from pathlib import Path
+from typing import SupportsFloat
+from urllib.parse import urlsplit
 
 import gradio as gr
+import httpx
 
 import reachy_conversation_tools
 from state import DEFAULT_CHARACTER_PROMPT, DEFAULT_QWEN_VOICE, DEFAULT_TTS_INSTRUCTIONS, DEFAULT_VOICE, RuntimeSettings, active_tools_for_profile, compose_system_prompt, list_profile_names, load_profile_character_prompt_by_name, load_profile_qwen_voice_by_name, load_profile_tts_instructions_by_name, load_profile_voice_by_name, normalize_profile_name, profile_has_prompt_audio_by_name, qwen_voice_choices, save_profile_definition, save_selected_profile_name, tsukasa_voice_choices
@@ -16,6 +19,8 @@ from state import DEFAULT_CHARACTER_PROMPT, DEFAULT_QWEN_VOICE, DEFAULT_TTS_INST
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 GUI_TOOL_NAMES = reachy_conversation_tools.GUI_TOOL_NAMES
+AUDIO_LEVEL_DEFAULT = 50
+AUDIO_CONTROL_TIMEOUT_S = 2.0
 
 
 def _subprocess_stdout(command: list[str]) -> str:
@@ -63,10 +68,75 @@ def _free_gradio_port_if_same_uv_app(port: int, app_path: Path) -> list[int]:
     return killed_pids
 
 
+def _reachy_daemon_http_base_url(robot_host: str | None) -> str:
+    host = str(robot_host or "").strip() or "reachy-mini.local"
+    parsed = urlsplit(host if "://" in host else f"http://{host}")
+    hostname = parsed.hostname or parsed.netloc or parsed.path
+    if not hostname:
+        raise ValueError("Reachy host is empty")
+    scheme = parsed.scheme or "http"
+    port = parsed.port or 8000
+    return f"{scheme}://{hostname}:{port}"
+
+
+def _coerce_audio_percent(value: SupportsFloat | str | None, *, fallback: int = AUDIO_LEVEL_DEFAULT) -> int:
+    if value is None:
+        return fallback
+    try:
+        return max(0, min(100, int(round(float(value)))))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _read_robot_audio_level(robot_host: str | None, endpoint: str, label: str) -> tuple[int, str]:
+    response = httpx.get(
+        f"{_reachy_daemon_http_base_url(robot_host)}/api/volume{endpoint}",
+        timeout=AUDIO_CONTROL_TIMEOUT_S,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    percent = _coerce_audio_percent(payload.get("volume"))
+    platform = str(payload.get("platform") or "unknown")
+    device = str(payload.get("device") or "unknown device")
+    return percent, f"{label}: {percent}% on {platform} / {device}"
+
+
+def _write_robot_audio_level(robot_host: str | None, endpoint: str, label: str, percent: float) -> tuple[int, str]:
+    requested = _coerce_audio_percent(percent)
+    response = httpx.post(
+        f"{_reachy_daemon_http_base_url(robot_host)}/api/volume{endpoint}",
+        json={"volume": requested},
+        timeout=AUDIO_CONTROL_TIMEOUT_S,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    applied = _coerce_audio_percent(payload.get("volume"), fallback=requested)
+    platform = str(payload.get("platform") or "unknown")
+    device = str(payload.get("device") or "unknown device")
+    return applied, f"{label}: {applied}% on {platform} / {device}"
+
+
+def _load_robot_audio_levels(robot_host: str | None) -> tuple[int, str, int, str]:
+    try:
+        volume, volume_status = _read_robot_audio_level(robot_host, "/current", "Volume Control")
+    except Exception as exc:
+        volume = AUDIO_LEVEL_DEFAULT
+        volume_status = f"Volume Control unavailable: {exc}"
+
+    try:
+        microphone, microphone_status = _read_robot_audio_level(robot_host, "/microphone/current", "Microphone")
+    except Exception as exc:
+        microphone = AUDIO_LEVEL_DEFAULT
+        microphone_status = f"Microphone unavailable: {exc}"
+
+    return volume, volume_status, microphone, microphone_status
+
+
 def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings) -> gr.Blocks:
     profiles_dir = runtime_settings.profiles_dir
     profile_names = list_profile_names(profiles_dir)
     initial_profile, initial_tools, initial_character_prompt, _initial_prompt, initial_voice, initial_qwen_voice, initial_tts_instructions, _initial_version = runtime_settings.snapshot()
+    initial_volume, _initial_volume_status, initial_microphone, _initial_microphone_status = _load_robot_audio_levels(args.robot_host)
     tsukasa_base_url = os.environ.get("TSUKASA_SPEECH_BASE_URL", "http://localhost:5001")
     qwen_dropdown_choices = qwen_voice_choices(include_custom=profile_has_prompt_audio_by_name(profiles_dir, initial_profile, "qwen3-tts"))
 
@@ -97,7 +167,28 @@ def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings)
         status = f"Loaded character '{selected_profile}'. You can edit the character prompt, Tsukasa voice, Qwen voice, save, or apply live."
         return character_prompt, selected_tools, tsukasa_dropdown_update(selected_profile, voice), qwen_dropdown_update(selected_profile, qwen_voice), tts_instructions, status
 
-    def on_apply(profile: str, character_prompt: str, selected_tools: list[str], voice: str, qwen_voice: str, tts_instructions: str) -> str:
+    def on_volume_change(volume: float) -> tuple[int, str]:
+        try:
+            return _write_robot_audio_level(args.robot_host, "/set", "Volume Control", volume)
+        except Exception as exc:
+            safe_volume = _coerce_audio_percent(volume)
+            return safe_volume, f"Volume Control unavailable: {exc}"
+
+    def on_microphone_change(volume: float) -> tuple[int, str]:
+        try:
+            return _write_robot_audio_level(args.robot_host, "/microphone/set", "Microphone", volume)
+        except Exception as exc:
+            safe_volume = _coerce_audio_percent(volume)
+            return safe_volume, f"Microphone unavailable: {exc}"
+
+    def on_apply(
+        profile: str,
+        character_prompt: str,
+        selected_tools: list[str],
+        voice: str,
+        qwen_voice: str,
+        tts_instructions: str,
+    ) -> str:
         if profile not in profile_names:
             return f"Unknown character '{profile}'."
         active_profile, enabled_tools, _character_prompt, _instructions, active_voice, active_qwen_voice, active_tts_instructions, _version = runtime_settings.update(
@@ -215,6 +306,9 @@ def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings)
         with gr.Row():
             apply_button = gr.Button("Apply Live", variant="primary")
             save_button = gr.Button("Save Character")
+        with gr.Row():
+            volume_slider = gr.Slider(label="Volume Control", minimum=0, maximum=100, step=1, value=initial_volume, interactive=True)
+            microphone_slider = gr.Slider(label="Microphone", minimum=0, maximum=100, step=1, value=initial_microphone, interactive=True)
 
         profile_dropdown.change(
             on_profile_change,
@@ -236,7 +330,16 @@ def build_gradio_ui(args: argparse.Namespace, runtime_settings: RuntimeSettings)
             inputs=[new_profile_box, character_box, tool_checkboxes, voice_dropdown, qwen_voice_dropdown, tts_instructions_box],
             outputs=[profile_dropdown, character_box, tool_checkboxes, voice_dropdown, qwen_voice_dropdown, tts_instructions_box, status_box, new_profile_box],
         )
-
+        volume_slider.input(
+            on_volume_change,
+            inputs=[volume_slider],
+            outputs=[volume_slider, status_box],
+        )
+        microphone_slider.input(
+            on_microphone_change,
+            inputs=[microphone_slider],
+            outputs=[microphone_slider, status_box],
+        )
     return demo
 
 

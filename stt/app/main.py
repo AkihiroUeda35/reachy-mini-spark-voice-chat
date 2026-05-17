@@ -271,7 +271,19 @@ def _tts_backend_for_request(req: "SpeechRequest") -> str:
         return backend
 
     language = req.language.strip().lower()
-    if language in {"english", "en", "en-us", "en-gb"} or _looks_english_text(req.input):
+    english_request = language in {"english", "en", "en-us", "en-gb"} or _looks_english_text(req.input)
+    if not english_request:
+        return backend
+
+    has_reference_voice = bool(req.ref_audio) or bool(req.ref_text)
+    if req.task_type != "Base" or has_reference_voice:
+        logger.info(
+            "Keeping English TTS request on %s because custom/reference voice settings are active",
+            backend,
+        )
+        return backend
+
+    if english_request:
         logger.info("Routing English TTS request to qwen3-tts instead of tsukasa-speech")
         return "qwen3-tts"
     return backend
