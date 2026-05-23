@@ -146,7 +146,7 @@ profile_default() {
       printf '%s' 'gemma4'
       ;;
     gemma4-31b:speculative_config)
-      printf '%s' '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":5}'
+      printf '%s' '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":4}'
       ;;
     gemma4-31b:tensor_parallel_size)
       printf '%s' '1'
