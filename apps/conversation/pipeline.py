@@ -746,10 +746,17 @@ class ReachyAudioPlayer(FrameProcessor):
         self._stop_playback_worker()
         if self._head_wobbler is None:
             return
-        finished = self._head_wobbler.finish(timeout_s=timeout_s)
+        try:
+            finished = self._head_wobbler.finish(timeout_s=timeout_s)
+        except ConnectionError as exc:
+            self._logger.warning("Head wobble reset skipped after robot disconnect: %s", exc)
+            finished = True
         if timeout_s is not None and not finished:
             self._logger.warning("Head wobble reset timed out")
-        self._head_wobbler.stop()
+        try:
+            self._head_wobbler.stop()
+        except ConnectionError as exc:
+            self._logger.warning("Head wobble stop skipped after robot disconnect: %s", exc)
 
     def _ensure_playback_worker(self) -> None:
         if self._playback_thread is not None and self._playback_thread.is_alive():

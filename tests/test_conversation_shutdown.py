@@ -12,8 +12,8 @@ import main
 from pipecat.frames.frames import OutputAudioRawFrame
 
 from gradio_ui import _free_gradio_port_if_same_uv_app, _is_same_conversation_app_process, _load_robot_audio_levels, _reachy_daemon_http_base_url, _write_robot_audio_level
-from main import _play_assistant_text, _run_pipeline_with_barge_in, CapturedUtterance, capture_robot_utterance, conversation_loop, is_recoverable_llm_turn_error
-from pipeline import SpeechInterruptedError, _create_turn_pipeline_runner
+from main import _play_assistant_text, _run_pipeline_with_barge_in, CapturedUtterance, capture_robot_utterance, conversation_loop, is_recoverable_llm_turn_error, is_recoverable_tts_stream_error
+from pipeline import ReachyAudioPlayer, SpeechInterruptedError, _create_turn_pipeline_runner
 from state import RuntimeSettings as StateRuntimeSettings
 
 
@@ -72,6 +72,34 @@ class ConversationShutdownTests(unittest.TestCase):
 
     def test_recoverable_llm_turn_error_ignores_unrelated_failures(self) -> None:
         self.assertFalse(is_recoverable_llm_turn_error(RuntimeError("TTS returned no audio.")))
+
+    def test_recoverable_tts_stream_error_matches_remote_protocol_disconnect(self) -> None:
+        self.assertTrue(
+            is_recoverable_tts_stream_error(
+                main.httpx.RemoteProtocolError(
+                    "peer closed connection without sending complete message body (incomplete chunked read)"
+                )
+            )
+        )
+
+    def test_recoverable_tts_stream_error_ignores_http_status_failures(self) -> None:
+        response = MagicMock()
+        response.status_code = 500
+        response.text = "server error"
+        self.assertFalse(
+            is_recoverable_tts_stream_error(
+                main.httpx.HTTPStatusError("boom", request=MagicMock(), response=response)
+            )
+        )
+
+    def test_recoverable_tts_stream_error_matches_wrapped_runtime_error(self) -> None:
+        self.assertTrue(
+            is_recoverable_tts_stream_error(
+                RuntimeError(
+                    "Streaming TTS failed: peer closed connection without sending complete message body (incomplete chunked read)"
+                )
+            )
+        )
 
     def test_parse_args_defaults_robot_host_from_env_setting(self) -> None:
         with (
@@ -274,6 +302,28 @@ class ConversationShutdownTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(speak_greeting.await_count, 1)
         self.assertEqual(speak_greeting.await_args.kwargs["reason"], "startup")
+
+    def test_conversation_loop_continues_after_startup_tts_stream_disconnect(self) -> None:
+        args = self._make_args(wake_up=False)
+        robot = self._make_robot()
+        runtime = MagicMock()
+        runtime.shutdown = AsyncMock()
+
+        with (
+            patch("main.resolve_runtime_models"),
+            patch("main.ReachyMini", return_value=robot),
+            patch("main.reachy_tools.ReachyToolRuntime", return_value=runtime),
+            patch(
+                "main._speak_persona_greeting_with_barge_in",
+                side_effect=main.httpx.RemoteProtocolError(
+                    "peer closed connection without sending complete message body (incomplete chunked read)"
+                ),
+            ),
+            patch("main.capture_robot_utterance", side_effect=KeyboardInterrupt),
+        ):
+            result = asyncio.run(conversation_loop(args))
+
+        self.assertEqual(result, 0)
 
     def test_conversation_loop_recovers_when_startup_greeting_is_interrupted(self) -> None:
         args = self._make_args(wake_up=False)
@@ -592,6 +642,18 @@ class ConversationShutdownTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIs(barge_in, captured)
 
+    def test_reachy_audio_player_close_ignores_disconnect_during_head_reset(self) -> None:
+        robot = self._make_robot()
+        player = ReachyAudioPlayer(robot, enable_head_wobble=False)
+        head_wobbler = MagicMock()
+        head_wobbler.finish.side_effect = ConnectionError("Lost connection with the server.")
+        player._head_wobbler = head_wobbler
+
+        player.close(timeout_s=0.1)
+
+        head_wobbler.finish.assert_called_once_with(timeout_s=0.1)
+        head_wobbler.stop.assert_called_once_with()
+
     def test_conversation_loop_reuses_barge_in_utterance_as_next_turn(self) -> None:
         args = self._make_args(wake_up=False)
         robot = self._make_robot()
@@ -675,6 +737,31 @@ class ConversationShutdownTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(speak_greeting.await_count, 2)
         self.assertEqual(speak_greeting.await_args_list[-1].kwargs["reason"], "character update")
+
+    def test_conversation_loop_continues_after_wrapped_tts_stream_disconnect(self) -> None:
+        args = self._make_args(wake_up=False)
+        robot = self._make_robot()
+        runtime = MagicMock()
+        runtime.shutdown = AsyncMock()
+        captured = CapturedUtterance(audio=MagicMock(), duration_ms=800.0, overlap_gate_active=False)
+
+        with (
+            patch("main.resolve_runtime_models"),
+            patch("main.ReachyMini", return_value=robot),
+            patch("main.reachy_tools.ReachyToolRuntime", return_value=runtime),
+            patch("main._speak_persona_greeting", AsyncMock(return_value=[])),
+            patch("main.capture_robot_utterance", side_effect=[captured, KeyboardInterrupt]),
+            patch("main.transcribe_captured_audio", AsyncMock(return_value={"text": "こんにちは", "segments": []})),
+            patch(
+                "main._run_pipeline_with_barge_in",
+                side_effect=RuntimeError(
+                    "Streaming TTS failed: peer closed connection without sending complete message body (incomplete chunked read)"
+                ),
+            ),
+        ):
+            result = asyncio.run(conversation_loop(args))
+
+        self.assertEqual(result, 0)
 
 
 if __name__ == "__main__":

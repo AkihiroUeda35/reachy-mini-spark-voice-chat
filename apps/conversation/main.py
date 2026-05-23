@@ -542,6 +542,16 @@ def is_recoverable_llm_turn_error(error: Exception) -> bool:
     )
 
 
+def is_recoverable_tts_stream_error(error: Exception) -> bool:
+    if isinstance(error, httpx.HTTPStatusError):
+        return False
+    message = str(error).lower()
+    return (
+        "streaming tts failed:" in message
+        or isinstance(error, httpx.HTTPError)
+    ) and ("peer closed connection" in message or "incomplete chunked read" in message)
+
+
 def _prepared_audio_from_pcm16(audio_bytes: bytes, *, sample_rate: int, stem: str) -> Any:
     return asr_tools.PreparedAudio(
         source_stem=stem,
@@ -1163,13 +1173,23 @@ async def conversation_loop(args: argparse.Namespace) -> int:
         await _run_blocking_cleanup_step(app_logger, "media.start_recording", robot.media.start_recording)
         await _run_blocking_cleanup_step(app_logger, "media.start_playing", robot.media.start_playing)
         app_logger.info("[bold]Reachy media pipelines started[/]")
-        history, pending_utterance = await _speak_persona_greeting_with_barge_in(
-            args,
-            robot,
-            history,
-            reason="startup",
-            assistant_speech_state=assistant_speech_state,
-        )
+        try:
+            history, pending_utterance = await _speak_persona_greeting_with_barge_in(
+                args,
+                robot,
+                history,
+                reason="startup",
+                assistant_speech_state=assistant_speech_state,
+            )
+        except Exception as exc:
+            if not is_recoverable_tts_stream_error(exc):
+                raise
+            logging.getLogger("conversation.tts").warning(
+                "[bold green]TTS[/] startup greeting aborted: %s",
+                exc,
+            )
+            history = trim_history(history, args.history_turns)
+            pending_utterance = None
 
         while not stop_event.is_set():
             active_profile, active_tools, _active_character_prompt, active_instructions, active_voice, active_qwen_voice, active_tts_instructions, settings_version = runtime_settings.snapshot()
@@ -1190,22 +1210,40 @@ async def conversation_loop(args: argparse.Namespace) -> int:
             _apply_profile_tts_prompt_assets(args, profiles_dir, active_profile)
             next_persona_signature = (active_profile, active_instructions)
             if live_greeting_reason is not None:
-                history, pending_utterance = await _speak_persona_greeting_with_barge_in(
-                    args,
-                    robot,
-                    history,
-                    reason=live_greeting_reason,
-                    assistant_speech_state=assistant_speech_state,
-                )
+                try:
+                    history, pending_utterance = await _speak_persona_greeting_with_barge_in(
+                        args,
+                        robot,
+                        history,
+                        reason=live_greeting_reason,
+                        assistant_speech_state=assistant_speech_state,
+                    )
+                except Exception as exc:
+                    if not is_recoverable_tts_stream_error(exc):
+                        raise
+                    logging.getLogger("conversation.tts").warning(
+                        "[bold green]TTS[/] live greeting aborted: %s",
+                        exc,
+                    )
+                    pending_utterance = None
                 current_persona_signature = next_persona_signature
             elif next_persona_signature != current_persona_signature:
-                history, pending_utterance = await _speak_persona_greeting_with_barge_in(
-                    args,
-                    robot,
-                    history,
-                    reason="persona switch",
-                    assistant_speech_state=assistant_speech_state,
-                )
+                try:
+                    history, pending_utterance = await _speak_persona_greeting_with_barge_in(
+                        args,
+                        robot,
+                        history,
+                        reason="persona switch",
+                        assistant_speech_state=assistant_speech_state,
+                    )
+                except Exception as exc:
+                    if not is_recoverable_tts_stream_error(exc):
+                        raise
+                    logging.getLogger("conversation.tts").warning(
+                        "[bold green]TTS[/] persona switch greeting aborted: %s",
+                        exc,
+                    )
+                    pending_utterance = None
                 current_persona_signature = next_persona_signature
             if pending_utterance is not None:
                 captured_utterance = pending_utterance
@@ -1299,10 +1337,24 @@ async def conversation_loop(args: argparse.Namespace) -> int:
                     llm_logger.info("[bold cyan]LLM[/] interrupted live reply because user speech was detected")
                     continue
             except RuntimeError as exc:
+                if is_recoverable_tts_stream_error(exc):
+                    logging.getLogger("conversation.tts").warning(
+                        "[bold green]TTS[/] reply stream aborted; waiting for next utterance: %s",
+                        exc,
+                    )
+                    continue
                 if is_recoverable_llm_turn_error(exc):
                     llm_logger.warning("[bold cyan]LLM[/] turn aborted without reply: %s", exc)
                     continue
                 raise
+            except Exception as exc:
+                if not is_recoverable_tts_stream_error(exc):
+                    raise
+                logging.getLogger("conversation.tts").warning(
+                    "[bold green]TTS[/] reply stream aborted; waiting for next utterance: %s",
+                    exc,
+                )
+                continue
             if result is None:
                 continue
             llm_logger.info("[bold cyan]LLM[/] assistant %s", result.assistant_text)
