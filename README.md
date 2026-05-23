@@ -176,9 +176,12 @@ The built-in LLM profiles are:
 
 - `qwen3.6-27b`
 - `gemma4-26b-a4b`
+- `gemma4-31b`
 - `gemma4-e4b`
 
 `gemma4-26b-a4b` is configured for `nvidia/Gemma-4-26B-A4B-NVFP4` plus the Gemma 4 assistant checkpoint `google/gemma-4-26B-A4B-it-assistant` via vLLM MTP speculative decoding. This repo now pins nightly vLLM with Transformers `main`; the profile starts successfully with `--enforce-eager` and serves OpenAI-compatible `/v1/models` and `/v1/chat/completions` on model name `spark`.
+
+`gemma4-31b` is configured for `nvidia/Gemma-4-31B-IT-NVFP4` and uses `google/gemma-4-26B-A4B-it-assistant` for vLLM MTP speculative decoding, with eager mode enabled and a more conservative default concurrency.
 
 `gemma4-e4b` is configured for `bg-digitalservices/Gemma-4-E4B-it-NVFP4` plus `google/gemma-4-E4B-it-assistant` via the same vLLM MTP path, with eager mode enabled by default.
 
