@@ -1,50 +1,13 @@
 ARG NGC_VLLM_IMAGE=nvcr.io/nvidia/vllm:26.04-py3
 ARG NGC_PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:25.04-py3
 
-FROM ${NGC_VLLM_IMAGE} AS vllm-base
+FROM ${NGC_VLLM_IMAGE} AS tts-runtime
 
 USER root
 
 RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
 WORKDIR /workspace
-
-FROM vllm-base AS llm-runtime
-
-# Keep torch aligned with spark-vllm-docker's runner image unless we intentionally diverge.
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
-ARG TORCH_VERSION=2.11.0
-# Gemma 4 assistant checkpoints require a newer Transformers revision than the wheel pins.
-ARG TRANSFORMERS_REF=main
-ARG VLLM_EXTRA_INDEX_URL=https://wheels.vllm.ai/nightly
-ARG VLLM_VERSION=0.20.2rc1.dev296+g140dc2ec3
-
-RUN python -m pip uninstall -y vllm || true
-
-RUN python -m pip install --no-cache-dir \
-    --index-url ${TORCH_INDEX_URL} \
-    "torch==${TORCH_VERSION}" \
-    torchvision \
-    torchaudio \
-    triton
-
-COPY spark-vllm-docker/wheels/*.whl /tmp/wheels/
-
-RUN python -m pip install --no-cache-dir /tmp/wheels/*.whl \
-    && python -m pip install --no-cache-dir "git+https://github.com/huggingface/transformers.git@${TRANSFORMERS_REF}" \
-    && python -m pip install --no-cache-dir --pre --no-deps --extra-index-url ${VLLM_EXTRA_INDEX_URL} "vllm==${VLLM_VERSION}" \
-    && python -m pip install --no-cache-dir fastsafetensors \
-    && rm -rf /tmp/wheels
-
-
-ENV HF_HOME=/models/huggingface \
-    TRANSFORMERS_CACHE=/models/huggingface \
-    FLASHINFER_DISABLE_VERSION_CHECK=1 \
-    VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-
-ENTRYPOINT ["llm-run"]
-
-FROM vllm-base AS tts-runtime
 
 ARG TTS_TORCH_VERSION=2.11.0
 ARG TTS_TORCHAUDIO_VERSION=2.11.0
@@ -73,7 +36,7 @@ ENV HF_HOME=/models/huggingface \
 
 ENTRYPOINT ["qwen3-tts-run"]
 
-FROM vllm-base AS stt-runtime
+FROM ${NGC_VLLM_IMAGE} AS stt-runtime
 
 ARG CTRANSLATE2_VERSION=4.7.1
 ARG CTRANSLATE2_CUDA_ARCHITECTURES=86

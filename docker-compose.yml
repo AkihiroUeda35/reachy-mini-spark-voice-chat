@@ -1,11 +1,11 @@
 services:
   vllm:
     build:
-      context: .
+      context: ./spark-vllm-docker
       dockerfile: Dockerfile
-      target: llm-runtime
+      target: runner
       args:
-        NGC_VLLM_IMAGE: ${LLM_NGC_VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.04-py3}
+        PRE_TRANSFORMERS: ${LLM_PRE_TRANSFORMERS:-0}
     entrypoint: ["sh", "/workspace/llm/run.sh"]
     container_name: vllm_node
     restart: unless-stopped
