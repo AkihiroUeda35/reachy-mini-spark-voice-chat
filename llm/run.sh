@@ -25,6 +25,9 @@ profile_default() {
     qwen3.6-27b:max_model_len)
       printf '%s' '262144'
       ;;
+    qwen3.6-27b:max_new_tokens)
+      printf '%s' '30000'
+      ;;
     qwen3.6-27b:max_num_seqs)
       printf '%s' '4'
       ;;
@@ -75,6 +78,9 @@ profile_default() {
       ;;
     gemma4-26b-a4b:max_model_len)
       printf '%s' '256000'
+      ;;
+    gemma4-26b-a4b:max_new_tokens)
+      printf '%s' '30000'
       ;;
     gemma4-26b-a4b:max_num_seqs)
       printf '%s' '2'
@@ -127,6 +133,9 @@ profile_default() {
     gemma4-31b:max_model_len)
       printf '%s' '256000'
       ;;
+    gemma4-31b:max_new_tokens)
+      printf '%s' '30000'
+      ;;
     gemma4-31b:max_num_seqs)
       printf '%s' '1'
       ;;
@@ -177,6 +186,9 @@ profile_default() {
       ;;
     gemma4-e4b:max_model_len)
       printf '%s' '256000'
+      ;;
+    gemma4-e4b:max_new_tokens)
+      printf '%s' '30000'
       ;;
     gemma4-e4b:max_num_seqs)
       printf '%s' '8'
@@ -246,6 +258,7 @@ port=$(resolve_value LLM_PORT port)
 served_model_name=$(resolve_value LLM_SERVED_MODEL_NAME served_model_name)
 quantization=$(resolve_value LLM_QUANTIZATION quantization)
 max_model_len=$(resolve_value LLM_MAX_MODEL_LEN max_model_len)
+max_new_tokens=$(resolve_optional_value LLM_MAX_NEW_TOKENS max_new_tokens)
 max_num_seqs=$(resolve_value LLM_MAX_NUM_SEQS max_num_seqs)
 kv_cache_dtype=$(resolve_value LLM_KV_CACHE_DTYPE kv_cache_dtype)
 gpu_memory_utilization=$(resolve_value LLM_GPU_MEMORY_UTILIZATION gpu_memory_utilization)
@@ -291,6 +304,10 @@ fi
 
 if [ -n "$generation_config" ]; then
   set -- "$@" --generation-config "$generation_config"
+fi
+
+if [ -n "$max_new_tokens" ]; then
+  set -- "$@" --override-generation-config "{\"max_new_tokens\":$max_new_tokens}"
 fi
 
 if [ -n "$speculative_config" ]; then
