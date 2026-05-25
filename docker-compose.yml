@@ -16,6 +16,8 @@ services:
     environment:
       NCCL_IGNORE_CPU_AFFINITY: "1"
       HF_HOME: /root/.cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
       TRANSFORMERS_CACHE: /root/.cache/huggingface
       LLM_PROFILE: ${LLM_PROFILE:-qwen3.6-27b}
       LLM_MODEL: ${LLM_MODEL:-}

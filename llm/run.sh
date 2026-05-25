@@ -20,22 +20,22 @@ profile_default() {
       printf '%s' 'spark'
       ;;
     qwen3.6-27b:quantization)
-      printf '%s' 'modelopt'
+      printf '%s' ''
       ;;
     qwen3.6-27b:max_model_len)
       printf '%s' '262144'
       ;;
     qwen3.6-27b:max_new_tokens)
-      printf '%s' '30000'
+      printf '%s' '100000'
       ;;
     qwen3.6-27b:max_num_seqs)
-      printf '%s' '4'
+      printf '%s' '8'
       ;;
     qwen3.6-27b:kv_cache_dtype)
-      printf '%s' 'fp8'
+      printf '%s' 'auto'
       ;;
     qwen3.6-27b:gpu_memory_utilization)
-      printf '%s' '0.6'
+      printf '%s' '0.4'
       ;;
     qwen3.6-27b:reasoning_parser)
       printf '%s' 'qwen3'
@@ -44,10 +44,10 @@ profile_default() {
       printf '%s' '1'
       ;;
     qwen3.6-27b:tool_call_parser)
-      printf '%s' 'qwen3_coder'
+      printf '%s' 'qwen3_xml'
       ;;
     qwen3.6-27b:speculative_config)
-      printf '%s' '{"method":"qwen3_5_mtp","num_speculative_tokens":4,"moe_backend":"triton"}'
+      printf '%s' '{"method":"dflash","model":"z-lab/Qwen3.6-27B-DFlash","num_speculative_tokens":15}'
       ;;
     qwen3.6-27b:tensor_parallel_size)
       printf '%s' ''
@@ -55,11 +55,14 @@ profile_default() {
     qwen3.6-27b:enable_prefix_caching)
       printf '%s' '0'
       ;;
+    qwen3.6-27b:limit_mm_per_prompt)
+      printf '%s' '{"video":{"count":1,"num_frames":32,"width":512,"height":512},"image":{"count":8,"width":1024,"height":1024}}'
+      ;;
     qwen3.6-27b:generation_config)
       printf '%s' ''
       ;;
     qwen3.6-27b:extra_args)
-      printf '%s' ''
+      printf '%s' '--attention-backend flash_attn --max-num-batched-tokens 8192'
       ;;
     gemma4-26b-a4b:model)
       printf '%s' 'bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4'
@@ -268,8 +271,18 @@ tool_call_parser=$(resolve_value LLM_TOOL_CALL_PARSER tool_call_parser)
 speculative_config=$(resolve_optional_value LLM_SPECULATIVE_CONFIG speculative_config)
 tensor_parallel_size=$(resolve_optional_value LLM_TENSOR_PARALLEL_SIZE tensor_parallel_size)
 enable_prefix_caching=$(resolve_value LLM_ENABLE_PREFIX_CACHING enable_prefix_caching)
+limit_mm_per_prompt=$(resolve_optional_value LLM_LIMIT_MM_PER_PROMPT limit_mm_per_prompt)
 generation_config=$(resolve_optional_value LLM_GENERATION_CONFIG generation_config)
 extra_args=$(resolve_optional_value LLM_EXTRA_ARGS extra_args)
+
+case "$speculative_config" in
+  *'"method":"dflash"'*)
+    if [ "$kv_cache_dtype" = "fp8" ]; then
+      echo "DFlash with flash_attn does not support fp8 KV cache; falling back to auto." >&2
+      kv_cache_dtype='auto'
+    fi
+    ;;
+esac
 
 if [ -z "$model" ]; then
   echo "No LLM model configured. Set LLM_MODEL or use a supported LLM_PROFILE." >&2
@@ -282,13 +295,19 @@ set -- \
   --port "$port" \
   --trust-remote-code \
   --served-model-name "$served_model_name" \
-  --quantization "$quantization" \
   --max-model-len "$max_model_len" \
   --max-num-seqs "$max_num_seqs" \
-  --kv-cache-dtype "$kv_cache_dtype" \
   --gpu-memory-utilization "$gpu_memory_utilization" \
   --reasoning-parser "$reasoning_parser" \
   --tool-call-parser "$tool_call_parser"
+
+if [ -n "$quantization" ]; then
+  set -- "$@" --quantization "$quantization"
+fi
+
+if [ -n "$kv_cache_dtype" ]; then
+  set -- "$@" --kv-cache-dtype "$kv_cache_dtype"
+fi
 
 if [ -n "$tensor_parallel_size" ]; then
   set -- "$@" --tensor-parallel-size "$tensor_parallel_size"
@@ -304,6 +323,10 @@ fi
 
 if [ -n "$generation_config" ]; then
   set -- "$@" --generation-config "$generation_config"
+fi
+
+if [ -n "$limit_mm_per_prompt" ]; then
+  set -- "$@" --limit-mm-per-prompt "$limit_mm_per_prompt"
 fi
 
 if [ -n "$max_new_tokens" ]; then
