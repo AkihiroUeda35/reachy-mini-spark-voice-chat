@@ -71,3 +71,16 @@ Current behavior notes:
 - `head_tracking` runs a local OpenCV face-tracking loop and drives Reachy's `look_at_image` API.
 - `dance` now depends on `reachy-mini-dances-library`, which is included in the project dependencies and can also be auto-installed at runtime if missing.
 - Gradio is on by default; use `--no-gradio` when you want the console loop only.
+
+## Family Recognition
+
+Put family reference images in [family](family) as PNG or JPEG files. The file stem is used as the family name, for example `おとうさん.png` becomes the `おとうさん` reference.
+
+When `--people-recognition` is enabled, each accepted user turn includes:
+
+- all family reference images from `--family-dir`
+- one camera image captured when VAD detects the start of the utterance
+
+Startup and persona-switch greetings also capture one camera image immediately before greeting generation, so the first greeting can use the same family-name/addressing context.
+
+The LLM prompt asks the model to compare the current speaker image with the family references and choose a natural Japanese form of address only when the match is clear. Disable this with `--no-people-recognition`.

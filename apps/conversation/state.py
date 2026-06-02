@@ -38,6 +38,7 @@ PROFILE_TTS_PROMPT_TEXT_LANGUAGE_HINTS: dict[str, str] = {
     "english": "en",
 }
 PROFILE_TTS_PROMPT_AUDIO_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
+FAMILY_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
 
 VOICE_CHOICES: list[tuple[str, str]] = [
     ("audio_ref", "Bundled Tsukasa reference voice. [Tsukasa]"),
@@ -209,6 +210,35 @@ def _audio_file_to_data_url(path: Path) -> str:
         mime_type = "audio/wav"
     encoded = base64.b64encode(audio_bytes).decode("utf-8")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def _image_file_to_data_url(path: Path) -> str:
+    image_bytes = path.read_bytes()
+    mime_type, _encoding = mimetypes.guess_type(path.name)
+    if mime_type not in {"image/png", "image/jpeg"}:
+        mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def load_family_image_references(family_dir: Path) -> list[dict[str, str]]:
+    references: list[dict[str, str]] = []
+    if not family_dir.is_dir():
+        return references
+
+    for path in sorted(family_dir.iterdir(), key=lambda candidate: candidate.name.lower()):
+        if not path.is_file() or path.suffix.lower() not in FAMILY_IMAGE_SUFFIXES:
+            continue
+        name = path.stem.strip()
+        if not name:
+            continue
+        try:
+            data_url = _image_file_to_data_url(path)
+        except OSError as exc:
+            logger.warning("Failed to load family image %s: %s", path, exc)
+            continue
+        references.append({"name": name, "image_url": data_url, "path": str(path)})
+    return references
 
 
 def _find_profile_prompt_audio_file(profile_dir: Path, stem: str) -> Path | None:

@@ -98,6 +98,12 @@ def _extract_chunk_text(chunk: Any) -> str:
     return ""
 
 
+def _to_langchain_message_content(content: Any) -> Any:
+    if isinstance(content, list):
+        return content
+    return _content_text(content)
+
+
 def _to_langchain_messages(messages: list[Any]) -> list[Any]:
     converted: list[Any] = []
     for message in messages:
@@ -109,7 +115,7 @@ def _to_langchain_messages(messages: list[Any]) -> list[Any]:
         role = str(message.get("role") or "")
         content = message.get("content", "")
         if role == "user":
-            converted.append(HumanMessage(content=_content_text(content)))
+            converted.append(HumanMessage(content=_to_langchain_message_content(content)))
         elif role == "assistant":
             converted.append(AIMessage(content=_content_text(content)))
         elif role == "system":
@@ -117,8 +123,56 @@ def _to_langchain_messages(messages: list[Any]) -> list[Any]:
     return converted
 
 
-def _build_llm_context(history: list[dict[str, str]], transcript_text: str) -> LLMContext:
-    messages: list[dict[str, Any]] = [*history, {"role": "user", "content": transcript_text}]
+def _build_user_turn_content(transcript_text: str, vision_context: dict[str, Any] | None) -> str | list[dict[str, Any]]:
+    if not vision_context:
+        return transcript_text
+
+    family_references = [
+        reference
+        for reference in vision_context.get("family_references", [])
+        if isinstance(reference, dict) and reference.get("name") and reference.get("image_url")
+    ]
+    speaker_image_url = str(vision_context.get("speaker_image_url") or "").strip()
+    if not family_references and not speaker_image_url:
+        return transcript_text
+
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                "User transcript:\n"
+                f"{transcript_text}\n\n"
+                "People recognition context:\n"
+                "- Family reference images are labeled by file name. Use these labels as candidate family names.\n"
+                "- The final speaker image, if present, was captured when this utterance started.\n"
+                "- Compare the speaker image with the family references and infer who is speaking only when the visual match is clear.\n"
+                "- Choose a natural Japanese form of address from the prompt, the relationship, and the visual evidence; if uncertain, avoid using a name."
+            ),
+        }
+    ]
+    for reference in family_references:
+        name = str(reference["name"])
+        content.extend(
+            [
+                {"type": "text", "text": f"Family reference: {name}"},
+                {"type": "image_url", "image_url": {"url": str(reference["image_url"])}},
+            ]
+        )
+    if speaker_image_url:
+        content.extend(
+            [
+                {"type": "text", "text": "Current speaker image captured at utterance start:"},
+                {"type": "image_url", "image_url": {"url": speaker_image_url}},
+            ]
+        )
+    return content
+
+
+def _build_llm_context(history: list[dict[str, Any]], transcript_text: str, vision_context: dict[str, Any] | None = None) -> LLMContext:
+    messages: list[dict[str, Any]] = [
+        *history,
+        {"role": "user", "content": _build_user_turn_content(transcript_text, vision_context)},
+    ]
     return LLMContext(messages=cast(Any, messages))
 
 
@@ -941,8 +995,9 @@ async def run_pipeline(
     args: argparse.Namespace,
     runtime: ReachyToolRuntime,
     transcript_text: str,
-    history: list[dict[str, str]],
+    history: list[dict[str, Any]],
     enabled_tool_names: list[str],
+    vision_context: dict[str, Any] | None = None,
     assistant_speech_state: AssistantSpeechState | None = None,
     runtime_settings: RuntimeSettings | None = None,
     expected_settings_version: int | None = None,
@@ -977,7 +1032,7 @@ async def run_pipeline(
         interrupt_task = asyncio.create_task(_wait_for_settings_interrupt(runtime_settings, expected_settings_version))
     if interrupt_event is not None:
         external_interrupt_task = asyncio.create_task(interrupt_event.wait())
-    await task.queue_frame(LLMContextFrame(_build_llm_context(history, transcript_text)))
+    await task.queue_frame(LLMContextFrame(_build_llm_context(history, transcript_text, vision_context)))
     interrupted = False
     try:
         if interrupt_task is None and external_interrupt_task is None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 from dataclasses import dataclass
 import logging
 import os
@@ -14,6 +15,7 @@ import json
 from collections import deque
 from contextlib import suppress
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -25,6 +27,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pipecat.frames.frames import EndFrame
 from pipecat.processors.frame_processor import FrameDirection
+from PIL import Image
 from pydantic import SecretStr
 from reachy_mini import ReachyMini
 from rich.logging import RichHandler
@@ -37,7 +40,7 @@ from openai_model_registry import resolve_model
 
 from gradio_ui import launch_gradio_ui
 from pipeline import PipelineResult, ReachyAudioPlayer, ReachyRealtimeTTSSession, SpeechInterruptedError, SynthesizedAudio, _drain_ready_segments, _resample_audio, run_pipeline, synthesize_audio_stream, synthesize_realtime_audio_stream
-from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, DEFAULT_TTS_INSTRUCTIONS, AssistantSpeechState, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, build_tts_request_voice, effective_tts_transport, listening_gate_settings, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_qwen_voice_by_name, load_profile_tts_instructions_by_name, load_profile_tts_ref_audio_by_name, load_profile_tts_ref_text_by_name, load_profile_voice_by_name, load_selected_profile_name, normalize_tts_backend_name, overlap_turn_rejection_reason, save_profile_definition as _save_profile_definition
+from state import APP_DIR, DEFAULT_CHARACTER_PROMPT, DEFAULT_DATA_DIR, DEFAULT_SYSTEM_PROMPT, DEFAULT_VOICE, DEFAULT_TTS_INSTRUCTIONS, AssistantSpeechState, RuntimeSettings, active_tools_for_profile as _active_tools_for_profile, build_tts_request_voice, effective_tts_transport, listening_gate_settings, load_family_image_references, load_profile_character_prompt_by_name, load_profile_prompt as _load_profile_prompt, load_profile_prompt_by_name, load_profile_qwen_voice_by_name, load_profile_tts_instructions_by_name, load_profile_tts_ref_audio_by_name, load_profile_tts_ref_text_by_name, load_profile_voice_by_name, load_selected_profile_name, normalize_tts_backend_name, overlap_turn_rejection_reason, save_profile_definition as _save_profile_definition
 
 load_entrypoint_env(local_tts, asr_tools)
 
@@ -94,6 +97,8 @@ class CapturedUtterance:
     barge_in_candidate: bool = False
     transcription_payload: str | dict[str, Any] | None = None
     transcript_text: str = ""
+    speaker_image_url: str = ""
+    speaker_image_path: str = ""
 
 
 def _normalize_transcript_language(value: Any) -> str:
@@ -329,7 +334,57 @@ def _content_text(content: Any) -> str:
     return str(content or "")
 
 
-async def _generate_persona_greeting(args: argparse.Namespace, *, reason: str) -> str:
+def _build_greeting_content(reason: str, vision_context: dict[str, Any] | None) -> str | list[dict[str, Any]]:
+    prompt = (
+        "You are about to speak first through a robot speaker. "
+        f"Give exactly one short greeting in Japanese for this {reason}. "
+        "Stay in character, keep it to one or two brief sentences, and do not mention these instructions. "
+        "Do not ask a question, do not use markdown, and do not call any tools."
+    )
+    if not vision_context:
+        return prompt
+
+    family_references = [
+        reference
+        for reference in vision_context.get("family_references", [])
+        if isinstance(reference, dict) and reference.get("name") and reference.get("image_url")
+    ]
+    speaker_image_url = str(vision_context.get("speaker_image_url") or "").strip()
+    if not family_references and not speaker_image_url:
+        return prompt
+
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                f"{prompt}\n\n"
+                "People recognition context for this greeting:\n"
+                "- Family reference images are labeled by file name. Use these labels as candidate family names.\n"
+                "- The current camera image, if present, was captured immediately before this greeting.\n"
+                "- Compare the current camera image with the family references and infer who is present only when the visual match is clear.\n"
+                "- Choose a natural Japanese form of address from the prompt, the relationship, and the visual evidence; if uncertain, avoid using a name."
+            ),
+        }
+    ]
+    for reference in family_references:
+        name = str(reference["name"])
+        content.extend(
+            [
+                {"type": "text", "text": f"Family reference: {name}"},
+                {"type": "image_url", "image_url": {"url": str(reference["image_url"])}},
+            ]
+        )
+    if speaker_image_url:
+        content.extend(
+            [
+                {"type": "text", "text": "Current camera image before greeting:"},
+                {"type": "image_url", "image_url": {"url": speaker_image_url}},
+            ]
+        )
+    return content
+
+
+async def _generate_persona_greeting(args: argparse.Namespace, *, reason: str, vision_context: dict[str, Any] | None = None) -> str:
     model = ChatOpenAI(
         model=args.chat_model,
         base_url=args.chat_base_url,
@@ -342,14 +397,7 @@ async def _generate_persona_greeting(args: argparse.Namespace, *, reason: str) -
     response = await model.ainvoke(
         [
             SystemMessage(content=args.system_prompt),
-            HumanMessage(
-                content=(
-                    "You are about to speak first through a robot speaker. "
-                    f"Give exactly one short greeting in Japanese for this {reason}. "
-                    "Stay in character, keep it to one or two brief sentences, and do not mention these instructions. "
-                    "Do not ask a question, do not use markdown, and do not call any tools."
-                )
-            ),
+            HumanMessage(content=_build_greeting_content(reason, vision_context)),
         ]
     )
     greeting = _content_text(getattr(response, "content", "")).strip()
@@ -404,14 +452,25 @@ async def _play_assistant_text(
 async def _speak_persona_greeting(
     args: argparse.Namespace,
     robot: ReachyMini,
-    history: list[dict[str, str]],
+    history: list[dict[str, Any]],
     *,
     reason: str,
     assistant_speech_state: AssistantSpeechState | None = None,
     interrupt_event: asyncio.Event | None = None,
     barge_in_ready_event: asyncio.Event | None = None,
-) -> list[dict[str, str]]:
-    greeting = await _generate_persona_greeting(args, reason=reason)
+) -> list[dict[str, Any]]:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    speaker_image_url, speaker_image_path = await _capture_speaker_image(
+        robot,
+        args,
+        timestamp=f"greeting_{timestamp}",
+    )
+    vision_context = build_people_recognition_context_from_image(
+        args,
+        speaker_image_url=speaker_image_url,
+        speaker_image_path=speaker_image_path,
+    )
+    greeting = await _generate_persona_greeting(args, reason=reason, vision_context=vision_context)
     if barge_in_ready_event is not None:
         barge_in_ready_event.set()
     logging.getLogger("conversation.llm").info("[bold cyan]LLM[/] greeting %s", greeting)
@@ -444,6 +503,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", help="Profile name under apps/conversation/profiles. Defaults to the last saved selection, or 'default'.")
     parser.add_argument("--profiles-dir", default=str(APP_DIR / "profiles"), help="Directory containing profile folders.")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="Directory for captured audio and snapshots.")
+    parser.add_argument("--family-dir", default=str(APP_DIR / "family"), help="Directory of family reference PNG/JPEG images. File stems are used as family names.")
+    parser.add_argument("--people-recognition", action=argparse.BooleanOptionalAction, default=True, help="Attach family reference images and the utterance-start camera image to each LLM turn.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
     parser.add_argument("--gradio", action=argparse.BooleanOptionalAction, default=True, help="Launch a simplified Gradio GUI for character and tool selection.")
     parser.add_argument("--gradio-host", default="127.0.0.1", help="Host interface for the Gradio GUI.")
@@ -563,6 +624,50 @@ def _prepared_audio_from_pcm16(audio_bytes: bytes, *, sample_rate: int, stem: st
     )
 
 
+def _jpeg_data_url(image_bytes: bytes) -> str:
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _frame_to_jpeg_bytes(frame: np.ndarray) -> bytes:
+    image_array = frame[:, :, ::-1] if frame.ndim == 3 and frame.shape[2] >= 3 else frame
+    buffer = BytesIO()
+    Image.fromarray(image_array).save(buffer, format="JPEG", quality=88)
+    return buffer.getvalue()
+
+
+async def _capture_speaker_image(
+    robot: ReachyMini,
+    args: argparse.Namespace,
+    *,
+    timestamp: str,
+) -> tuple[str, str]:
+    if not getattr(args, "people_recognition", True):
+        return "", ""
+
+    logger = logging.getLogger("conversation.vision")
+    try:
+        frame = await asyncio.to_thread(robot.media.get_frame)
+    except Exception as exc:
+        logger.warning("[bold yellow]Vision[/] speaker snapshot failed: %s", exc)
+        return "", ""
+    if frame is None:
+        return "", ""
+
+    try:
+        jpeg_bytes = await asyncio.to_thread(_frame_to_jpeg_bytes, frame)
+        speaker_dir = Path(args.data_dir).expanduser().resolve() / "speaker"
+        speaker_dir.mkdir(parents=True, exist_ok=True)
+        speaker_path = speaker_dir / f"speaker_{timestamp}.jpg"
+        speaker_path.write_bytes(jpeg_bytes)
+    except Exception as exc:
+        logger.warning("[bold yellow]Vision[/] failed to encode speaker snapshot: %s", exc)
+        return "", ""
+
+    logger.info("[bold yellow]Vision[/] speaker snapshot saved to %s", speaker_path)
+    return _jpeg_data_url(jpeg_bytes), str(speaker_path)
+
+
 async def capture_robot_utterance(
     robot: ReachyMini,
     args: argparse.Namespace,
@@ -585,6 +690,9 @@ async def capture_robot_utterance(
     preroll: deque[tuple[float, bytes]] = deque()
     preroll_ms = 0.0
     captured_chunks: list[bytes] = []
+    speaker_image_url = ""
+    speaker_image_path = ""
+    speaker_image_task: asyncio.Task[tuple[str, str]] | None = None
 
     logger.info(
         "[bold blue]ASR[/] waiting for speech threshold=%.4f start=%dms end=%dms preroll=%dms",
@@ -641,6 +749,15 @@ async def capture_robot_utterance(
         if not speech_active and speech_ms >= active_vad_start_ms:
             speech_active = True
             capture_started_at = perf_counter()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            speaker_image_task = asyncio.create_task(
+                _capture_speaker_image(
+                    robot,
+                    args,
+                    timestamp=timestamp,
+                ),
+                name="speaker-image-capture",
+            )
             if overlap_gate_active:
                 logger.info(
                     "[bold blue]ASR[/] speech detected with overlap gate threshold=%.4f start=%dms",
@@ -677,6 +794,10 @@ async def capture_robot_utterance(
                 break
 
     if not captured_chunks:
+        if speaker_image_task is not None:
+            speaker_image_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await speaker_image_task
         return None
 
     captured_duration_ms = sum(len(chunk) for chunk in captured_chunks) / 2 / args.sample_rate * 1000.0
@@ -687,7 +808,14 @@ async def capture_robot_utterance(
             captured_duration_ms,
             min_overlap_vad_ms,
         )
+        if speaker_image_task is not None:
+            speaker_image_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await speaker_image_task
         return None
+
+    if speaker_image_task is not None:
+        speaker_image_url, speaker_image_path = await speaker_image_task
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return CapturedUtterance(
@@ -695,6 +823,8 @@ async def capture_robot_utterance(
         duration_ms=captured_duration_ms,
         overlap_gate_active=overlap_gate_active,
         barge_in_candidate=barge_in_candidate,
+        speaker_image_url=speaker_image_url,
+        speaker_image_path=speaker_image_path,
     )
 
 
@@ -742,11 +872,49 @@ def resolve_runtime_models(args: argparse.Namespace) -> None:
     )
 
 
-def trim_history(history: list[dict[str, str]], max_turns: int) -> list[dict[str, str]]:
+def trim_history(history: list[dict[str, Any]], max_turns: int) -> list[dict[str, Any]]:
     max_messages = max(0, max_turns * 2)
     if max_messages <= 0:
         return []
     return history[-max_messages:]
+
+
+def build_people_recognition_context_from_image(
+    args: argparse.Namespace,
+    *,
+    speaker_image_url: str,
+    speaker_image_path: str,
+) -> dict[str, Any] | None:
+    if not getattr(args, "people_recognition", True):
+        return None
+
+    family_references = load_family_image_references(Path(args.family_dir).expanduser().resolve())
+    if not family_references and not speaker_image_url:
+        return None
+
+    logger = logging.getLogger("conversation.vision")
+    if family_references:
+        logger.info(
+            "[bold yellow]Vision[/] loaded %d family reference image(s): %s",
+            len(family_references),
+            ", ".join(reference["name"] for reference in family_references),
+        )
+    if not speaker_image_url:
+        logger.info("[bold yellow]Vision[/] no speaker snapshot available for this turn")
+
+    return {
+        "family_references": family_references,
+        "speaker_image_url": speaker_image_url,
+        "speaker_image_path": speaker_image_path,
+    }
+
+
+def build_people_recognition_context(args: argparse.Namespace, utterance: CapturedUtterance) -> dict[str, Any] | None:
+    return build_people_recognition_context_from_image(
+        args,
+        speaker_image_url=utterance.speaker_image_url,
+        speaker_image_path=utterance.speaker_image_path,
+    )
 
 
 def save_reply_audio(data_dir: Path, audio: SynthesizedAudio) -> Path:
@@ -977,11 +1145,11 @@ async def _capture_barge_in_utterance(
 async def _speak_persona_greeting_with_barge_in(
     args: argparse.Namespace,
     robot: ReachyMini,
-    history: list[dict[str, str]],
+    history: list[dict[str, Any]],
     *,
     reason: str,
     assistant_speech_state: AssistantSpeechState,
-) -> tuple[list[dict[str, str]], CapturedUtterance | None]:
+) -> tuple[list[dict[str, Any]], CapturedUtterance | None]:
     interrupt_event = asyncio.Event()
     barge_in_ready_event = asyncio.Event()
     greeting_task = asyncio.create_task(
@@ -1034,8 +1202,9 @@ async def _run_pipeline_with_barge_in(
     args: argparse.Namespace,
     runtime: reachy_tools.ReachyToolRuntime,
     transcript_text: str,
-    history: list[dict[str, str]],
+    history: list[dict[str, Any]],
     active_tools: list[str],
+    vision_context: dict[str, Any] | None,
     *,
     robot: ReachyMini,
     assistant_speech_state: AssistantSpeechState,
@@ -1049,6 +1218,7 @@ async def _run_pipeline_with_barge_in(
             transcript_text,
             history,
             active_tools,
+            vision_context=vision_context,
             assistant_speech_state=assistant_speech_state,
             interrupt_event=interrupt_event,
             llm_finished_event=barge_in_ready_event,
@@ -1124,7 +1294,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
     if args.robot_name:
         robot_kwargs["robot_name"] = args.robot_name
 
-    history: list[dict[str, str]] = []
+    history: list[dict[str, Any]] = []
     data_dir = Path(args.data_dir).expanduser().resolve()
     last_settings_version = 0
     current_persona_signature = (args.profile, args.system_prompt)
@@ -1322,6 +1492,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
                 if saved is not None:
                     asr_logger.info("[bold blue]ASR[/] transcript saved to %s", saved)
 
+            vision_context = build_people_recognition_context(args, captured_utterance)
             llm_logger.info("[bold cyan]LLM[/] user %s", transcript_text)
             try:
                 result, pending_utterance = await _run_pipeline_with_barge_in(
@@ -1330,6 +1501,7 @@ async def conversation_loop(args: argparse.Namespace) -> int:
                     transcript_text,
                     history,
                     active_tools,
+                    vision_context,
                     robot=robot,
                     assistant_speech_state=assistant_speech_state,
                 )
