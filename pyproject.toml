@@ -2,6 +2,7 @@
 name = "spark-voice-chat"
 version = "0.1.0"
 description = "Qwen TTS-LLM-STT voice chat server and client on DGX spark"
+license = {text = "MIT"}
 requires-python = ">=3.13"
 dependencies = [
     "ddgs>=9.0.0",
