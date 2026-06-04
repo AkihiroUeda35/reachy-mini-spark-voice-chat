@@ -604,6 +604,8 @@ class ReachyTTSProcessor(FrameProcessor):
 
     async def request_interrupt(self) -> None:
         self._interrupt_event.set()
+        if self._worker_task is not None and not self._worker_task.done():
+            self._worker_task.cancel()
         if self._segment_queue is None:
             return
         while True:

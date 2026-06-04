@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import unicodedata
 from collections.abc import Mapping
 from typing import Any
@@ -14,7 +15,7 @@ JMA_AREA_URL = "https://www.jma.go.jp/bosai/common/const/area.json"
 JMA_FORECAST_URL = "https://www.jma.go.jp/bosai/forecast/data/forecast/{office_code}.json"
 JMA_OVERVIEW_URL = "https://www.jma.go.jp/bosai/forecast/data/overview_forecast/{office_code}.json"
 JMA_TIMEOUT = httpx.Timeout(20.0)
-DEFAULT_CITY = "長岡京市"
+DEFAULT_CITY = os.environ.get("JMA_DEFAULT_CITY", "長岡京市")
 
 _AREA_CACHE: dict[str, Any] | None = None
 _AREA_CACHE_LOCK = asyncio.Lock()
@@ -305,7 +306,7 @@ def format_jma_weather_report(report: Mapping[str, Any]) -> str:
 
 @tool
 async def get_jma_weather_tool(city: str = DEFAULT_CITY) -> str:
-    """Get the latest JMA weather forecast for a Japanese municipality. Omit city to use 長岡京市."""
+    """Get the latest JMA weather forecast for a Japanese municipality."""
     city = str(city or DEFAULT_CITY).strip() or DEFAULT_CITY
     try:
         result = await get_jma_weather(city)
@@ -313,5 +314,10 @@ async def get_jma_weather_tool(city: str = DEFAULT_CITY) -> str:
         return json.dumps({"error": f"Failed to fetch JMA weather: {exc}", "requested": city}, ensure_ascii=False)
     return format_jma_weather_report(result)
 
+
+get_jma_weather_tool.description = (
+    f"Get the latest JMA weather forecast for a Japanese municipality. "
+    f"Omit city to use {DEFAULT_CITY}."
+)
 
 LANGGRAPH_TOOLS = [get_jma_weather_tool]

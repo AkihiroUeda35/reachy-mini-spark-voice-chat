@@ -359,10 +359,9 @@ def _build_greeting_content(reason: str, vision_context: dict[str, Any] | None) 
             "text": (
                 f"{prompt}\n\n"
                 "People recognition context for this greeting:\n"
-                "- Family reference images are labeled by file name. Use these labels as candidate family names.\n"
-                "- The current camera image, if present, was captured immediately before this greeting.\n"
+                "- Family reference images are labeled with the family names.\n"
+                "- The current camera image is captured on  conversation.\n"
                 "- Compare the current camera image with the family references and infer who is present only when the visual match is clear.\n"
-                "- Choose a natural Japanese form of address from the prompt, the relationship, and the visual evidence; if uncertain, avoid using a name."
             ),
         }
     ]
