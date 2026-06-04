@@ -617,7 +617,6 @@ class ReachyTTSProcessor(FrameProcessor):
                 self._segment_queue.task_done()
                 if item is None:
                     return
-        await self._segment_queue.put(None)
 
     async def _stop_worker(self) -> None:
         if self._segment_queue is not None:
@@ -795,7 +794,7 @@ class ReachyAudioPlayer(FrameProcessor):
         if self._head_wobbler is not None:
             self._head_wobbler.stop()
 
-    def close(self, timeout_s: float | None = None) -> None:
+    def close(self, timeout_s: float | None = 1.0) -> None:
         if self._closed:
             return
         self._closed = True
@@ -825,7 +824,6 @@ class ReachyAudioPlayer(FrameProcessor):
         if self._playback_thread is None:
             return
         self._playback_queue.put(None)
-        self._playback_queue.join()
         self._playback_stop.set()
         self._playback_thread.join(timeout=1.0)
         self._playback_thread = None

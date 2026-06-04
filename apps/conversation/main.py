@@ -87,6 +87,7 @@ ASSISTANT_SPEAKING_INTERRUPT_MIN_CHARS = int(
         os.environ.get("ASSISTANT_SPEAKING_MIN_CHARS", "4"),
     )
 )
+ASSISTANT_SPEAKING_THRESHOLD_BOOST = float(os.environ.get("ASSISTANT_SPEAKING_THRESHOLD_BOOST", "0.005"))
 
 
 @dataclass
@@ -530,7 +531,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vad-end-ms", type=int, default=asr_tools.ASR_VAD_END_MS, help="Silence duration required to trigger capture end.")
     parser.add_argument("--vad-preroll-ms", type=int, default=asr_tools.ASR_VAD_PREROLL_MS, help="Audio to keep before VAD start.")
     parser.add_argument("--vad-max-seconds", type=float, default=asr_tools.ASR_VAD_MAX_SECONDS, help="Maximum capture duration per turn.")
-    parser.add_argument("--assistant-speaking-threshold-boost", type=float, default=0.005, help="Additional VAD RMS threshold applied while Reachy's own reply is still playing.")
+    parser.add_argument("--assistant-speaking-threshold-boost", type=float, default=ASSISTANT_SPEAKING_THRESHOLD_BOOST, help="Additional VAD RMS threshold applied while Reachy's own reply is still playing.")
     parser.add_argument("--assistant-speaking-vad-start-ms", type=int, default=400, help="Minimum continuous speech required to start capture while Reachy's reply is still playing.")
     parser.add_argument("--assistant-speaking-min-vad-ms", type=int, default=500, help="Minimum captured speech duration required to keep a turn while Reachy's reply is still playing.")
     parser.add_argument("--assistant-speaking-min-chars", type=int, default=4, help="Minimum transcript length required to keep a turn while Reachy's reply is still playing.")
